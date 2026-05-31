@@ -1,0 +1,1365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>eLabOrchestra Block Editor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #1A1A2A; }
+  #blocklyDiv { width: 100%; height: 100%; }
+
+  /* Blockly theme overrides */
+  .blocklyToolboxDiv { background: #252535 !important; border-right: 1px solid #333360 !important; }
+  .blocklyTreeLabel { color: #CCC !important; font-family: 'Segoe UI', sans-serif !important; font-size: 11px !important; }
+  .blocklyTreeRow:hover .blocklyTreeLabel { color: #fff !important; }
+  .blocklyTreeSelected .blocklyTreeLabel { color: #fff !important; }
+  .blocklyFlyout { background: #1E1E30 !important; }
+  .blocklyScrollbarHandle { fill: #4C97FF !important; }
+  .blocklyMainBackground { fill: #1A1A2A !important; }
+
+  /* Status bar */
+  #statusBar {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    height: 24px; background: #0F0F1A;
+    border-top: 1px solid #333355;
+    color: #8888AA; font: 11px 'Segoe UI', sans-serif;
+    display: flex; align-items: center; padding: 0 10px; gap: 16px;
+    z-index: 1000;
+  }
+  #statusBar span { color: #CCC; }
+</style>
+</head>
+<body>
+
+<div id="blocklyDiv"></div>
+
+<div id="statusBar">
+  Blocks: <span id="blockCount">0</span>
+  &nbsp;|&nbsp;
+  Status: <span id="runStatus">Idle</span>
+  &nbsp;|&nbsp;
+  <span id="lastMsg"></span>
+</div>
+
+<!-- Blockly pinned to 10.4.3 — stable: has Xml API, inputTypes, no FocusManager bug -->
+<script src="https://unpkg.com/blockly@10.4.3/blockly_compressed.js"></script>
+<script src="https://unpkg.com/blockly@10.4.3/blocks_compressed.js"></script>
+<script src="https://unpkg.com/blockly@10.4.3/msg/en.js"></script>
+<!-- Qt WebChannel JS bridge -->
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+<script>
+// ── Custom colour palette ─────────────────────────────────────────────────
+const COLOUR = {
+  EVENTS:      '#FFAB19',
+  INSTRUMENT:  '#4C97FF',
+  MEASUREMENT: '#5CB1D6',
+  CONTROL:     '#FF8C1A',
+  LOGGING:     '#9966FF',
+  PSU:         '#43A047',   // power supply — green
+  LMG:         '#9C27B0',   // LMG450 power analyser — violet
+  DASH:        '#E64A19',   // Dashboard — deep orange
+  DSP:         '#00838F',   // Magtrol DSP7000 — teal
+};
+
+// ── Custom block definitions ──────────────────────────────────────────────
+
+// ─ Events ─
+Blockly.defineBlocksWithJsonArray([
+{
+  "type": "lcr_when_start",
+  "message0": "▶ when started",
+  "nextStatement": null,
+  "colour": COLOUR.EVENTS,
+  "tooltip": "Runs the stack below when the program starts.",
+  "hat": "cap"
+},
+{
+  "type": "lcr_when_timer",
+  "message0": "every %1 s",
+  "args0": [{ "type": "field_number", "name": "INTERVAL", "value": 1, "min": 0.1, "precision": 0.1 }],
+  "nextStatement": null,
+  "colour": COLOUR.EVENTS,
+  "tooltip": "Repeats the stack below on a fixed interval.",
+  "hat": "cap"
+},
+// ─ Instrument ─
+{
+  "type": "lcr_set_mode",
+  "message0": "set mode %1",
+  "args0": [{ "type": "field_dropdown", "name": "MODE",
+    "options": [["Cs","Cs"],["Cp","Cp"],["Ls","Ls"],["Lp","Lp"],
+                ["Rs","Rs"],["Rp","Rp"],["Z","Z"],["D","D"],
+                ["Q","Q"],["θ (Phase)","Theta"],["ESR","ESR"],["DCR","DCR"]] }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.INSTRUMENT,
+  "tooltip": "Set the measurement mode."
+},
+{
+  "type": "lcr_set_frequency",
+  "message0": "set frequency %1",
+  "args0": [{ "type": "field_dropdown", "name": "FREQ",
+    "options": [["100 Hz","F100Hz"],["120 Hz","F120Hz"],["1 kHz","F1kHz"],
+                ["10 kHz","F10kHz"],["100 kHz","F100kHz"]] }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.INSTRUMENT,
+  "tooltip": "Set the test frequency."
+},
+{
+  "type": "lcr_hold",
+  "message0": "hold %1",
+  "args0": [{ "type": "field_dropdown", "name": "STATE",
+    "options": [["ON","true"],["OFF","false"]] }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.INSTRUMENT,
+  "tooltip": "Freeze (hold) the current reading."
+},
+{
+  "type": "lcr_rel",
+  "message0": "REL %1",
+  "args0": [{ "type": "field_dropdown", "name": "STATE",
+    "options": [["ON","true"],["OFF","false"]] }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.INSTRUMENT,
+  "tooltip": "Enable/disable relative measurement mode."
+},
+{
+  "type": "lcr_beep",
+  "message0": "beep",
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.INSTRUMENT,
+  "tooltip": "Trigger a beep on the device."
+},
+// ─ Measurement reporters ─
+{
+  "type": "lcr_read_primary",
+  "message0": "primary value",
+  "output": "Number",
+  "colour": COLOUR.MEASUREMENT,
+  "tooltip": "Returns the current primary measurement value."
+},
+{
+  "type": "lcr_read_secondary",
+  "message0": "secondary value",
+  "output": "Number",
+  "colour": COLOUR.MEASUREMENT,
+  "tooltip": "Returns the current secondary measurement value."
+},
+{
+  "type": "lcr_read_phase",
+  "message0": "phase angle °",
+  "output": "Number",
+  "colour": COLOUR.MEASUREMENT,
+  "tooltip": "Returns the phase angle in degrees."
+},
+{
+  "type": "lcr_read_mode",
+  "message0": "current mode",
+  "output": "String",
+  "colour": COLOUR.MEASUREMENT,
+  "tooltip": "Returns the active measurement mode as a string."
+},
+{
+  "type": "lcr_read_freq",
+  "message0": "test frequency",
+  "output": "String",
+  "colour": COLOUR.MEASUREMENT,
+  "tooltip": "Returns the current test frequency label."
+},
+{
+  "type": "lcr_is_overload",
+  "message0": "overload?",
+  "output": "Boolean",
+  "colour": COLOUR.MEASUREMENT,
+  "tooltip": "True if the meter is showing an overload."
+},
+// ─ Logging ─
+{
+  "type": "lcr_log_measurement",
+  "message0": "log measurement to CSV",
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.LOGGING,
+  "tooltip": "Log all measurement values to the active CSV file."
+},
+{
+  "type": "lcr_log_value",
+  "message0": "log %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "LABEL", "text": "value" },
+    { "type": "input_value", "name": "VALUE", "check": ["Number","String"] }
+  ],
+  "inputsInline": true,
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.LOGGING,
+  "tooltip": "Log a labelled value to the active CSV file."
+},
+{
+  "type": "lcr_show_value",
+  "message0": "show %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "LABEL", "text": "value" },
+    { "type": "input_value", "name": "VALUE", "check": ["Number","String"] }
+  ],
+  "inputsInline": true,
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.LOGGING,
+  "tooltip": "Display a labelled value in the status bar."
+},
+{
+  "type": "lcr_start_log",
+  "message0": "start CSV log %1",
+  "args0": [{ "type": "field_input", "name": "FILE", "text": "log.csv" }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.LOGGING,
+  "tooltip": "Open a CSV file for logging."
+},
+{
+  "type": "lcr_stop_log",
+  "message0": "stop CSV log",
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.LOGGING,
+  "tooltip": "Close the active CSV log file."
+},
+]);
+
+// ── Power Supply blocks (OWON SP3103) ─────────────────────────────────────
+Blockly.defineBlocksWithJsonArray([
+{
+  "type": "psu_set_voltage",
+  "message0": "PSU set voltage %1",
+  "args0": [{ "type": "input_value", "name": "VOLTAGE", "check": "Number" }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.PSU,
+  "tooltip": "Set the power supply output voltage (0 – 30 V)."
+},
+{
+  "type": "psu_set_current",
+  "message0": "PSU set current limit %1",
+  "args0": [{ "type": "input_value", "name": "CURRENT", "check": "Number" }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.PSU,
+  "tooltip": "Set the power supply current limit (0 – 3 A)."
+},
+{
+  "type": "psu_output",
+  "message0": "PSU output %1",
+  "args0": [{ "type": "field_dropdown", "name": "STATE",
+    "options": [["ON","ON"],["OFF","OFF"]] }],
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.PSU,
+  "tooltip": "Enable or disable the power supply output."
+},
+{
+  "type": "psu_read_voltage",
+  "message0": "PSU voltage",
+  "output": "Number",
+  "colour": COLOUR.PSU,
+  "tooltip": "Read the measured output voltage in volts."
+},
+{
+  "type": "psu_read_current",
+  "message0": "PSU current",
+  "output": "Number",
+  "colour": COLOUR.PSU,
+  "tooltip": "Read the measured output current in amps."
+},
+{
+  "type": "psu_read_power",
+  "message0": "PSU power",
+  "output": "Number",
+  "colour": COLOUR.PSU,
+  "tooltip": "Read the measured output power in watts (V × I)."
+},
+{
+  "type": "psu_is_output_on",
+  "message0": "PSU output is ON?",
+  "output": "Boolean",
+  "colour": COLOUR.PSU,
+  "tooltip": "True when the power supply output is enabled."
+},
+]);
+
+// ── LMG450 Power Analyser blocks ─────────────────────────────────────────────
+Blockly.defineBlocksWithJsonArray([
+
+// ─ Commands ─
+{
+  "type": "lmg_select_channel",
+  "message0": "LMG select channel %1",
+  "args0": [{ "type": "field_dropdown", "name": "CHANNEL",
+    "options": [["1","1"],["2","2"],["3","3"],["4","4"]] }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.LMG,
+  "tooltip": "Set the active measurement channel (1–4)."
+},
+{
+  "type": "lmg_set_averaging",
+  "message0": "LMG averaging %1",
+  "args0": [{ "type": "input_value", "name": "COUNT", "check": "Number" }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.LMG,
+  "tooltip": "Set number of cycles to average (1–128)."
+},
+{
+  "type": "lmg_integration_start",
+  "message0": "LMG integration start",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.LMG,
+  "tooltip": "Start the energy / charge integration timer."
+},
+{
+  "type": "lmg_integration_stop",
+  "message0": "LMG integration stop",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.LMG,
+  "tooltip": "Pause the energy / charge integration timer."
+},
+{
+  "type": "lmg_integration_reset",
+  "message0": "LMG integration reset",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.LMG,
+  "tooltip": "Reset energy and charge accumulators to zero."
+},
+
+// ─ Single-channel reporters ─
+{
+  "type": "lmg_read_voltage",
+  "message0": "LMG voltage (Vrms)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "True-RMS voltage of the active channel (V)."
+},
+{
+  "type": "lmg_read_current",
+  "message0": "LMG current (Arms)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "True-RMS current of the active channel (A)."
+},
+{
+  "type": "lmg_read_power",
+  "message0": "LMG active power (W)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Active power P of the active channel (W)."
+},
+{
+  "type": "lmg_read_reactive",
+  "message0": "LMG reactive power (VAr)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Reactive power Q of the active channel (VAr)."
+},
+{
+  "type": "lmg_read_apparent",
+  "message0": "LMG apparent power (VA)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Apparent power S of the active channel (VA)."
+},
+{
+  "type": "lmg_read_pf",
+  "message0": "LMG power factor λ",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Power factor λ = P/S of the active channel (−1…+1)."
+},
+{
+  "type": "lmg_read_phase",
+  "message0": "LMG phase angle φ (°)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Phase angle between voltage and current (degrees)."
+},
+{
+  "type": "lmg_read_frequency",
+  "message0": "LMG frequency (Hz)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Voltage frequency of the active channel (Hz)."
+},
+{
+  "type": "lmg_read_energy",
+  "message0": "LMG energy (Wh)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Accumulated energy of the active channel (Wh)."
+},
+{
+  "type": "lmg_read_charge",
+  "message0": "LMG charge (Ah)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Accumulated charge of the active channel (Ah)."
+},
+{
+  "type": "lmg_read_thd_v",
+  "message0": "LMG voltage THD (%)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Total harmonic distortion of voltage (%)."
+},
+{
+  "type": "lmg_read_thd_i",
+  "message0": "LMG current THD (%)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Total harmonic distortion of current (%)."
+},
+{
+  "type": "lmg_read_harmonic_v",
+  "message0": "LMG voltage harmonic order %1",
+  "args0": [{ "type": "input_value", "name": "ORDER", "check": "Number" }],
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Amplitude of the nth voltage harmonic (V)."
+},
+{
+  "type": "lmg_read_harmonic_i",
+  "message0": "LMG current harmonic order %1",
+  "args0": [{ "type": "input_value", "name": "ORDER", "check": "Number" }],
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Amplitude of the nth current harmonic (A)."
+},
+
+// ─ Aggregate reporters ─
+{
+  "type": "lmg_read_psum",
+  "message0": "LMG total active power ∑P (W)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Sum of active powers across all channels (W)."
+},
+{
+  "type": "lmg_read_qsum",
+  "message0": "LMG total reactive power ∑Q (VAr)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Sum of reactive powers across all channels (VAr)."
+},
+{
+  "type": "lmg_read_ssum",
+  "message0": "LMG total apparent power ∑S (VA)",
+  "output": "Number", "colour": COLOUR.LMG,
+  "tooltip": "Sum of apparent powers across all channels (VA)."
+},
+]);
+
+// ── Toolbox XML ───────────────────────────────────────────────────────────
+const TOOLBOX = {
+  kind: "categoryToolbox",
+  contents: [
+    {
+      kind: "category", name: "Events", colour: COLOUR.EVENTS,
+      contents: [
+        { kind: "block", type: "lcr_when_start" },
+        { kind: "block", type: "lcr_when_timer" },  // INTERVAL is a field_number, no shadow needed
+      ]
+    },
+    {
+      kind: "category", name: "Hantek LCR 1833C", colour: COLOUR.INSTRUMENT,
+      contents: [
+        { kind: "block", type: "lcr_set_mode" },
+        { kind: "block", type: "lcr_set_frequency" },
+        { kind: "block", type: "lcr_hold" },
+        { kind: "block", type: "lcr_rel" },
+        { kind: "block", type: "lcr_beep" },
+        { kind: "sep" },
+        { kind: "block", type: "lcr_read_primary" },
+        { kind: "block", type: "lcr_read_secondary" },
+        { kind: "block", type: "lcr_read_phase" },
+        { kind: "block", type: "lcr_read_mode" },
+        { kind: "block", type: "lcr_read_freq" },
+        { kind: "block", type: "lcr_is_overload" },
+      ]
+    },
+    {
+      kind: "category", name: "Power Supply", colour: COLOUR.PSU,
+      contents: [
+        { kind: "block", type: "psu_output" },
+        { kind: "block", type: "psu_set_voltage",
+          inputs: { VOLTAGE: { shadow: { type: "math_number", fields: { NUM: 5 } } } } },
+        { kind: "block", type: "psu_set_current",
+          inputs: { CURRENT: { shadow: { type: "math_number", fields: { NUM: 0.5 } } } } },
+        { kind: "block", type: "psu_read_voltage" },
+        { kind: "block", type: "psu_read_current" },
+        { kind: "block", type: "psu_read_power" },
+        { kind: "block", type: "psu_is_output_on" },
+      ]
+    },
+    {
+      kind: "category", name: "LMG450", colour: COLOUR.LMG,
+      contents: [
+        // ─ setup ─
+        { kind: "block", type: "lmg_select_channel" },
+        { kind: "block", type: "lmg_set_averaging",
+          inputs: { COUNT: { shadow: { type: "math_number", fields: { NUM: 1 } } } } },
+        // ─ integration ─
+        { kind: "block", type: "lmg_integration_start" },
+        { kind: "block", type: "lmg_integration_stop"  },
+        { kind: "block", type: "lmg_integration_reset" },
+        // ─ single-channel reporters ─
+        { kind: "block", type: "lmg_read_voltage"   },
+        { kind: "block", type: "lmg_read_current"   },
+        { kind: "block", type: "lmg_read_power"     },
+        { kind: "block", type: "lmg_read_reactive"  },
+        { kind: "block", type: "lmg_read_apparent"  },
+        { kind: "block", type: "lmg_read_pf"        },
+        { kind: "block", type: "lmg_read_phase"     },
+        { kind: "block", type: "lmg_read_frequency" },
+        { kind: "block", type: "lmg_read_energy"    },
+        { kind: "block", type: "lmg_read_charge"    },
+        { kind: "block", type: "lmg_read_thd_v"     },
+        { kind: "block", type: "lmg_read_thd_i"     },
+        { kind: "block", type: "lmg_read_harmonic_v",
+          inputs: { ORDER: { shadow: { type: "math_number", fields: { NUM: 1 } } } } },
+        { kind: "block", type: "lmg_read_harmonic_i",
+          inputs: { ORDER: { shadow: { type: "math_number", fields: { NUM: 1 } } } } },
+        // ─ aggregate reporters ─
+        { kind: "block", type: "lmg_read_psum" },
+        { kind: "block", type: "lmg_read_qsum" },
+        { kind: "block", type: "lmg_read_ssum" },
+      ]
+    },
+    {
+      kind: "category", name: "DSP7000", colour: COLOUR.DSP,
+      contents: [
+        // ─ channel ─
+        { kind: "block", type: "dsp_select_channel" },
+        // ─ speed ─
+        { kind: "block", type: "dsp_set_speed",
+          inputs: { RPM: { shadow: { type: "math_number", fields: { NUM: 1500 } } } } },
+        { kind: "block", type: "dsp_reset_speed" },
+        // ─ torque ─
+        { kind: "block", type: "dsp_set_torque",
+          inputs: { TORQUE: { shadow: { type: "math_number", fields: { NUM: 10 } } } } },
+        { kind: "block", type: "dsp_reset_torque" },
+        // ─ current ─
+        { kind: "block", type: "dsp_set_current",
+          inputs: { PCT: { shadow: { type: "math_number", fields: { NUM: 50 } } } } },
+        // ─ ramp ─
+        { kind: "block", type: "dsp_ramp_up",
+          inputs: { RATE: { shadow: { type: "math_number", fields: { NUM: 100 } } } } },
+        { kind: "block", type: "dsp_ramp_down",
+          inputs: { RATE: { shadow: { type: "math_number", fields: { NUM: 100 } } } } },
+        { kind: "block", type: "dsp_abort_ramp" },
+        // ─ reset ─
+        { kind: "block", type: "dsp_reset_channel" },
+        // ─ alarms ─
+        { kind: "block", type: "dsp_set_speed_alarm",
+          inputs: { RPM: { shadow: { type: "math_number", fields: { NUM: 5000 } } } } },
+        { kind: "block", type: "dsp_set_torque_alarm",
+          inputs: { TORQUE: { shadow: { type: "math_number", fields: { NUM: 100 } } } } },
+        { kind: "block", type: "dsp_set_power_alarm",
+          inputs: { KW: { shadow: { type: "math_number", fields: { NUM: 10 } } } } },
+        { kind: "block", type: "dsp_alarms_enable" },
+        // ─ misc ─
+        { kind: "block", type: "dsp_freeze_pid" },
+        { kind: "block", type: "dsp_tare" },
+        { kind: "block", type: "dsp_save" },
+        // ─ reporters ─
+        { kind: "block", type: "dsp_read_speed" },
+        { kind: "block", type: "dsp_read_torque" },
+        { kind: "block", type: "dsp_read_power" },
+        { kind: "block", type: "dsp_read_direction" },
+      ]
+    },
+    {
+      kind: "category", name: "Dashboard", colour: COLOUR.DASH,
+      contents: [
+        // ─ gauge ─
+        { kind: "block", type: "dash_set_gauge",
+          inputs: { VALUE: { shadow: { type: "math_number", fields: { NUM: 0 } } } } },
+        { kind: "block", type: "dash_config_gauge",
+          inputs: {
+            MIN: { shadow: { type: "math_number", fields: { NUM: 0 } } },
+            MAX: { shadow: { type: "math_number", fields: { NUM: 100 } } }
+          } },
+        // ─ Y-T chart ─
+        { kind: "block", type: "dash_plot_yt",
+          inputs: { VALUE: { shadow: { type: "math_number", fields: { NUM: 0 } } } } },
+        { kind: "block", type: "dash_config_yt",
+          inputs: { WINDOW: { shadow: { type: "math_number", fields: { NUM: 60 } } } } },
+        // ─ X-Y chart ─
+        { kind: "block", type: "dash_plot_xy",
+          inputs: {
+            X: { shadow: { type: "math_number", fields: { NUM: 0 } } },
+            Y: { shadow: { type: "math_number", fields: { NUM: 0 } } }
+          } },
+        { kind: "block", type: "dash_config_xy" },
+        // ─ text ─
+        { kind: "block", type: "dash_show_text" },
+        { kind: "block", type: "dash_config_text" },
+        // ─ utility ─
+        { kind: "block", type: "dash_clear_chart" },
+        // ─ controls ─
+        { kind: "block", type: "dash_config_button" },
+        { kind: "block", type: "dash_button_clicked" },
+        { kind: "block", type: "dash_config_checkbox" },
+        { kind: "block", type: "dash_checkbox_state" },
+        { kind: "block", type: "dash_config_dropdown" },
+        { kind: "block", type: "dash_dropdown_value" },
+        // ─ slider ─
+        { kind: "block", type: "dash_config_slider",
+          inputs: {
+            MIN:  { shadow: { type: "math_number", fields: { NUM: 0   } } },
+            MAX:  { shadow: { type: "math_number", fields: { NUM: 100 } } },
+            STEP: { shadow: { type: "math_number", fields: { NUM: 1   } } }
+          } },
+        { kind: "block", type: "dash_set_slider",
+          inputs: { VALUE: { shadow: { type: "math_number", fields: { NUM: 0 } } } } },
+        { kind: "block", type: "dash_slider_value" },
+        // ─ knob ─
+        { kind: "block", type: "dash_config_knob",
+          inputs: {
+            MIN:  { shadow: { type: "math_number", fields: { NUM: 0   } } },
+            MAX:  { shadow: { type: "math_number", fields: { NUM: 100 } } },
+            STEP: { shadow: { type: "math_number", fields: { NUM: 1   } } }
+          } },
+        { kind: "block", type: "dash_set_knob",
+          inputs: { VALUE: { shadow: { type: "math_number", fields: { NUM: 0 } } } } },
+        { kind: "block", type: "dash_knob_value" },
+        // ─ switch ─
+        { kind: "block", type: "dash_config_switch" },
+        { kind: "block", type: "dash_set_switch" },
+        { kind: "block", type: "dash_switch_state" },
+      ]
+    },
+    {
+      kind: "category", name: "Control", colour: "#FF8C1A",
+      contents: [
+        { kind: "block", type: "controls_repeat_ext",
+          inputs: { TIMES: { shadow: { type: "math_number", fields: { NUM: 10 } } } } },
+        { kind: "block", type: "controls_whileUntil" },
+        { kind: "block", type: "controls_if" },
+        { kind: "block", type: "controls_if", extraState: { elseIfCount: 1, elseCount: 1 } },
+      ]
+    },
+    {
+      kind: "category", name: "Timing", colour: "#FF8C1A",
+      contents: [
+        { kind: "block", type: "lcr_wait",
+          inputs: { SECS: { shadow: { type: "math_number", fields: { NUM: 1 } } } } },
+      ]
+    },
+    {
+      kind: "category", name: "Variables", colour: "#FF6680",
+      custom: "VARIABLE"
+    },
+    {
+      kind: "category", name: "Math", colour: "#59C059",
+      contents: [
+        { kind: "block", type: "math_number" },
+        { kind: "block", type: "math_arithmetic" },
+        { kind: "block", type: "math_round" },
+        { kind: "block", type: "math_single" },
+        { kind: "block", type: "math_constrain" },
+      ]
+    },
+    {
+      kind: "category", name: "Logic", colour: "#59C059",
+      contents: [
+        { kind: "block", type: "logic_compare" },
+        { kind: "block", type: "logic_operation" },
+        { kind: "block", type: "logic_negate" },
+        { kind: "block", type: "logic_boolean" },
+      ]
+    },
+    {
+      kind: "category", name: "Text", colour: "#5C81A6",
+      contents: [
+        { kind: "block", type: "text" },
+        { kind: "block", type: "text_join" },
+        { kind: "block", type: "text_length" },
+      ]
+    },
+    {
+      kind: "category", name: "Logging", colour: COLOUR.LOGGING,
+      contents: [
+        { kind: "block", type: "lcr_log_measurement" },
+        { kind: "block", type: "lcr_log_value" },
+        { kind: "block", type: "lcr_show_value" },
+        { kind: "block", type: "lcr_start_log" },
+        { kind: "block", type: "lcr_stop_log" },
+      ]
+    },
+  ]
+};
+
+// ── Magtrol DSP7000 Dynamometer Controller blocks ─────────────────────────
+Blockly.defineBlocksWithJsonArray([
+
+// ─ Channel select ─
+{
+  "type": "dsp_select_channel",
+  "message0": "DSP7000 select channel %1",
+  "args0": [{ "type": "field_dropdown", "name": "CHANNEL",
+    "options": [["1","1"],["2","2"]] }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the active DSP7000 channel for subsequent commands."
+},
+
+// ─ Speed control ─
+{
+  "type": "dsp_set_speed",
+  "message0": "DSP7000 set speed %1 rpm",
+  "args0": [{ "type": "input_value", "name": "RPM", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the speed setpoint (rpm) and enable closed-loop speed control."
+},
+{
+  "type": "dsp_reset_speed",
+  "message0": "DSP7000 reset speed (free run)",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Release speed control: motor goes to free run, brake off."
+},
+
+// ─ Torque control ─
+{
+  "type": "dsp_set_torque",
+  "message0": "DSP7000 set torque %1 N·m",
+  "args0": [{ "type": "input_value", "name": "TORQUE", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the torque setpoint (N·m) and enable closed-loop torque control."
+},
+{
+  "type": "dsp_reset_torque",
+  "message0": "DSP7000 reset torque",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Release torque control and set brake current to zero."
+},
+
+// ─ Current output ─
+{
+  "type": "dsp_set_current",
+  "message0": "DSP7000 set brake current %1 %",
+  "args0": [{ "type": "input_value", "name": "PCT", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the brake current output percentage (0 – 99.99 %)."
+},
+
+// ─ Ramp ─
+{
+  "type": "dsp_ramp_up",
+  "message0": "DSP7000 ramp up  profile %1  rate/time %2",
+  "args0": [
+    { "type": "field_dropdown", "name": "PROFILE",
+      "options": [["linear","0"],["cosine","1"]] },
+    { "type": "input_value", "name": "RATE", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Ramp up to the current speed setpoint. Rate = rpm/s (linear) or test length in seconds (cosine)."
+},
+{
+  "type": "dsp_ramp_down",
+  "message0": "DSP7000 ramp down  profile %1  rate/time %2",
+  "args0": [
+    { "type": "field_dropdown", "name": "PROFILE",
+      "options": [["linear","0"],["cosine","1"]] },
+    { "type": "input_value", "name": "RATE", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Ramp down to 0 rpm. Rate = rpm/s (linear) or test length in seconds (cosine)."
+},
+{
+  "type": "dsp_abort_ramp",
+  "message0": "DSP7000 abort ramp",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Halt the ramp immediately and return to free run."
+},
+
+// ─ Channel reset ─
+{
+  "type": "dsp_reset_channel",
+  "message0": "DSP7000 reset channel",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Reset the active channel: manual control on, brake off."
+},
+
+// ─ Alarms ─
+{
+  "type": "dsp_set_speed_alarm",
+  "message0": "DSP7000 speed alarm %1 rpm",
+  "args0": [{ "type": "input_value", "name": "RPM", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the over-speed alarm threshold (rpm)."
+},
+{
+  "type": "dsp_set_torque_alarm",
+  "message0": "DSP7000 torque alarm %1 N·m",
+  "args0": [{ "type": "input_value", "name": "TORQUE", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the over-torque alarm threshold (N·m)."
+},
+{
+  "type": "dsp_set_power_alarm",
+  "message0": "DSP7000 power alarm %1 kW",
+  "args0": [{ "type": "input_value", "name": "KW", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Set the over-power alarm threshold (kW)."
+},
+{
+  "type": "dsp_alarms_enable",
+  "message0": "DSP7000 alarms %1",
+  "args0": [{ "type": "field_dropdown", "name": "STATE",
+    "options": [["enabled","1"],["disabled","0"]] }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Enable or disable all alarms on the active channel."
+},
+
+// ─ PID / misc ─
+{
+  "type": "dsp_freeze_pid",
+  "message0": "DSP7000 PID %1",
+  "args0": [{ "type": "field_dropdown", "name": "STATE",
+    "options": [["freeze","1"],["unfreeze","0"]] }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Freeze or unfreeze the PID control loop."
+},
+{
+  "type": "dsp_tare",
+  "message0": "DSP7000 tare %1",
+  "args0": [{ "type": "field_dropdown", "name": "STATE",
+    "options": [["ON","1"],["OFF","0"]] }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Enable or disable the tare function."
+},
+{
+  "type": "dsp_save",
+  "message0": "DSP7000 save config",
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DSP,
+  "tooltip": "Save the current configuration to non-volatile memory."
+},
+
+// ─ Reporters ─
+{
+  "type": "dsp_read_speed",
+  "message0": "DSP7000 speed ch %1 (rpm)",
+  "args0": [{ "type": "field_dropdown", "name": "CHANNEL",
+    "options": [["1","1"],["2","2"]] }],
+  "output": "Number", "colour": COLOUR.DSP,
+  "tooltip": "Read the current speed of the selected channel (rpm)."
+},
+{
+  "type": "dsp_read_torque",
+  "message0": "DSP7000 torque ch %1 (N·m)",
+  "args0": [{ "type": "field_dropdown", "name": "CHANNEL",
+    "options": [["1","1"],["2","2"]] }],
+  "output": "Number", "colour": COLOUR.DSP,
+  "tooltip": "Read the current torque of the selected channel (N·m)."
+},
+{
+  "type": "dsp_read_power",
+  "message0": "DSP7000 power ch %1 (W)",
+  "args0": [{ "type": "field_dropdown", "name": "CHANNEL",
+    "options": [["1","1"],["2","2"]] }],
+  "output": "Number", "colour": COLOUR.DSP,
+  "tooltip": "Read the computed shaft power of the selected channel (W)."
+},
+{
+  "type": "dsp_read_direction",
+  "message0": "DSP7000 direction ch %1",
+  "args0": [{ "type": "field_dropdown", "name": "CHANNEL",
+    "options": [["1","1"],["2","2"]] }],
+  "output": "String", "colour": COLOUR.DSP,
+  "tooltip": "Read the shaft direction: R (CW), L (CCW) or A (alarm)."
+},
+]);
+
+// ── Dashboard / Visualization blocks ─────────────────────────────────────
+Blockly.defineBlocksWithJsonArray([
+
+// ─ Gauge ─
+{
+  "type": "dash_set_gauge",
+  "message0": "dashboard gauge %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "NAME", "text": "gauge1" },
+    { "type": "input_value", "name": "VALUE", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Set the value of a named gauge widget on the dashboard."
+},
+{
+  "type": "dash_config_gauge",
+  "message0": "configure gauge %1 label %2 min %3 max %4 colour %5",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "gauge1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "Value" },
+    { "type": "input_value",  "name": "MIN",    "check": "Number" },
+    { "type": "input_value",  "name": "MAX",    "check": "Number" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#4C97FF" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Configure the label, range and colour of a gauge."
+},
+
+// ─ Y-T Chart ─
+{
+  "type": "dash_plot_yt",
+  "message0": "dashboard Y-T chart %1 add value %2",
+  "args0": [
+    { "type": "field_input", "name": "NAME",  "text": "chart1" },
+    { "type": "input_value", "name": "VALUE", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Append a data point to a Y-T (time-series) chart."
+},
+{
+  "type": "dash_config_yt",
+  "message0": "configure Y-T chart %1 label %2 colour %3 window %4 s",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "chart1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "Signal" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#4C97FF" },
+    { "type": "input_value",  "name": "WINDOW", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Configure a Y-T chart (label, trace colour, time window in seconds)."
+},
+
+// ─ X-Y Chart ─
+{
+  "type": "dash_plot_xy",
+  "message0": "dashboard X-Y chart %1 add x %2 y %3",
+  "args0": [
+    { "type": "field_input", "name": "NAME", "text": "xy1" },
+    { "type": "input_value", "name": "X",    "check": "Number" },
+    { "type": "input_value", "name": "Y",    "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Append an (x, y) point to an X-Y scatter/line chart."
+},
+{
+  "type": "dash_config_xy",
+  "message0": "configure X-Y chart %1 label %2 colour %3",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "xy1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "XY Plot" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#FF6680" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Configure an X-Y chart (label, trace colour)."
+},
+
+// ─ Text display ─
+{
+  "type": "dash_show_text",
+  "message0": "dashboard text %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "NAME",  "text": "text1" },
+    { "type": "input_value", "name": "VALUE", "check": ["Number","String"] }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Show a value in a named text display widget."
+},
+{
+  "type": "dash_config_text",
+  "message0": "configure text display %1 label %2 colour %3",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "text1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "Reading" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#9966FF" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Configure a text display widget (label, colour)."
+},
+
+// ─ Utility ─
+{
+  "type": "dash_clear_chart",
+  "message0": "dashboard clear chart %1",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "chart1" }],
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Clear all data points from a chart."
+},
+
+// ─ Button / checkbox / dropdown controls ─
+{
+  "type": "dash_config_button",
+  "message0": "configure button %1 label %2 colour %3",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "btn1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "Click me" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#E64A19" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Add / configure a button on the dashboard."
+},
+{
+  "type": "dash_button_clicked",
+  "message0": "button %1 clicked?",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "btn1" }],
+  "output": "Boolean",
+  "colour": COLOUR.DASH,
+  "tooltip": "True once after the button is clicked (latching — resets after read)."
+},
+{
+  "type": "dash_config_checkbox",
+  "message0": "configure checkbox %1 label %2 default %3",
+  "args0": [
+    { "type": "field_input",    "name": "NAME",    "text": "chk1" },
+    { "type": "field_input",    "name": "LABEL",   "text": "Enable" },
+    { "type": "field_dropdown", "name": "DEFAULT",
+      "options": [["unchecked","false"],["checked","true"]] }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Add / configure a checkbox on the dashboard."
+},
+{
+  "type": "dash_checkbox_state",
+  "message0": "checkbox %1 is checked?",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "chk1" }],
+  "output": "Boolean",
+  "colour": COLOUR.DASH,
+  "tooltip": "True when the checkbox is ticked."
+},
+{
+  "type": "dash_config_dropdown",
+  "message0": "configure dropdown %1 label %2 options %3",
+  "args0": [
+    { "type": "field_input", "name": "NAME",    "text": "dd1" },
+    { "type": "field_input", "name": "LABEL",   "text": "Choose" },
+    { "type": "field_input", "name": "OPTIONS", "text": "A,B,C" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Add / configure a dropdown (options are comma-separated)."
+},
+{
+  "type": "dash_dropdown_value",
+  "message0": "dropdown %1 value",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "dd1" }],
+  "output": "String",
+  "colour": COLOUR.DASH,
+  "tooltip": "Returns the currently-selected option of a dropdown."
+},
+
+// ─ Knob ─
+{
+  "type": "dash_config_knob",
+  "message0": "configure knob %1 label %2 min %3 max %4 step %5 colour %6",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "knob1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "Setpoint" },
+    { "type": "input_value",  "name": "MIN",    "check": "Number" },
+    { "type": "input_value",  "name": "MAX",    "check": "Number" },
+    { "type": "input_value",  "name": "STEP",   "check": "Number" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#4C97FF" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Add / configure a rotary knob. Drag up/down or use scroll wheel to change value."
+},
+{
+  "type": "dash_set_knob",
+  "message0": "dashboard set knob %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "NAME",  "text": "knob1" },
+    { "type": "input_value", "name": "VALUE", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Programmatically set a knob to a specific value."
+},
+{
+  "type": "dash_knob_value",
+  "message0": "knob %1 value",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "knob1" }],
+  "output": "Number",
+  "colour": COLOUR.DASH,
+  "tooltip": "Returns the current position of the knob."
+},
+
+// ─ Slider ─
+{
+  "type": "dash_config_slider",
+  "message0": "configure slider %1 label %2 min %3 max %4 step %5 colour %6",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",   "text": "slider1" },
+    { "type": "field_input",  "name": "LABEL",  "text": "Value" },
+    { "type": "input_value",  "name": "MIN",    "check": "Number" },
+    { "type": "input_value",  "name": "MAX",    "check": "Number" },
+    { "type": "input_value",  "name": "STEP",   "check": "Number" },
+    { "type": "field_colour", "name": "COLOUR", "colour": "#4C97FF" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Add / configure a horizontal slider with step-snapping and scroll-wheel support."
+},
+{
+  "type": "dash_set_slider",
+  "message0": "dashboard set slider %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "NAME",  "text": "slider1" },
+    { "type": "input_value", "name": "VALUE", "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Programmatically move a slider to a specific value."
+},
+{
+  "type": "dash_slider_value",
+  "message0": "slider %1 value",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "slider1" }],
+  "output": "Number",
+  "colour": COLOUR.DASH,
+  "tooltip": "Returns the current position of the slider."
+},
+
+// ─ Switch ─
+{
+  "type": "dash_config_switch",
+  "message0": "configure switch %1 label %2 ON label %3 OFF label %4 colour %5",
+  "args0": [
+    { "type": "field_input",  "name": "NAME",      "text": "sw1" },
+    { "type": "field_input",  "name": "LABEL",     "text": "Enable" },
+    { "type": "field_input",  "name": "ON_LABEL",  "text": "ON" },
+    { "type": "field_input",  "name": "OFF_LABEL", "text": "OFF" },
+    { "type": "field_colour", "name": "COLOUR",    "colour": "#43A047" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Add / configure an animated toggle switch."
+},
+{
+  "type": "dash_set_switch",
+  "message0": "dashboard set switch %1 %2",
+  "args0": [
+    { "type": "field_input",    "name": "NAME",  "text": "sw1" },
+    { "type": "field_dropdown", "name": "STATE",
+      "options": [["ON","true"],["OFF","false"]] }
+  ],
+  "inputsInline": true,
+  "previousStatement": null, "nextStatement": null,
+  "colour": COLOUR.DASH,
+  "tooltip": "Programmatically set a switch ON or OFF."
+},
+{
+  "type": "dash_switch_state",
+  "message0": "switch %1 is ON?",
+  "args0": [{ "type": "field_input", "name": "NAME", "text": "sw1" }],
+  "output": "Boolean",
+  "colour": COLOUR.DASH,
+  "tooltip": "True when the switch is in the ON position."
+},
+]);
+
+// Extra blocks referenced in toolbox
+Blockly.defineBlocksWithJsonArray([
+{
+  "type": "lcr_wait",
+  "message0": "wait %1 s",
+  "args0": [{ "type": "input_value", "name": "SECS", "check": "Number" }],
+  "inputsInline": true,
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": "#FF8C1A",
+  "tooltip": "Pause execution for the given number of seconds."
+},
+]);
+
+// ── Dark theme ────────────────────────────────────────────────────────────
+const darkTheme = Blockly.Theme.defineTheme('elab_dark', {
+  base: Blockly.Themes.Classic,
+  componentStyles: {
+    workspaceBackgroundColour: '#1A1A2A',
+    toolboxBackgroundColour:   '#252535',
+    toolboxForegroundColour:   '#CCCCDD',
+    flyoutBackgroundColour:    '#1E1E30',
+    flyoutForegroundColour:    '#CCCCDD',
+    flyoutOpacity: 1,
+    scrollbarColour: '#4C97FF',
+    insertionMarkerColour: '#ffffff',
+    insertionMarkerOpacity: 0.3,
+    scrollbarOpacity: 0.6,
+    cursorColour: '#d0d0ff',
+  },
+  fontStyle: { family: "'Segoe UI', Arial, sans-serif", size: 11 },
+  blockStyles: {
+    hat_blocks:         { colourPrimary: COLOUR.EVENTS },
+    logic_blocks:       { colourPrimary: '#59C059' },
+    loop_blocks:        { colourPrimary: '#FF8C1A' },
+    math_blocks:        { colourPrimary: '#59C059' },
+    text_blocks:        { colourPrimary: '#5C81A6' },
+    variable_blocks:    { colourPrimary: '#FF6680' },
+    variable_dynamic_blocks: { colourPrimary: '#FF6680' },
+    procedure_blocks:   { colourPrimary: '#AA55CC' },
+  }
+});
+
+// ── Workspace init ────────────────────────────────────────────────────────
+const workspace = Blockly.inject('blocklyDiv', {
+  toolbox: TOOLBOX,
+  theme: darkTheme,
+  grid: { spacing: 20, length: 3, colour: '#252540', snap: true },
+  zoom: { controls: true, wheel: true, startScale: 1.0, maxScale: 3, minScale: 0.3 },
+  trashcan: true,
+  move: { scrollbars: true, drag: true, wheel: false },
+  sounds: false,
+});
+
+// Fix height to leave room for status bar
+function resize() {
+  document.getElementById('blocklyDiv').style.height =
+    (window.innerHeight - 24) + 'px';
+  Blockly.svgResize(workspace);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Python bridge via QWebChannel ────────────────────────────────────────
+let bridge = null;
+
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  bridge = channel.objects.bridge;
+
+  // Restore saved workspace if available.
+  // Bridge stores XML (Blockly.Xml still works in v10); use domToWorkspace, not textToDom.
+  bridge.get_workspace(function(xml) {
+    if (xml && xml.trim()) {
+      try {
+        const parser = new DOMParser();
+        const dom = parser.parseFromString(xml, 'text/xml').firstChild;
+        Blockly.Xml.domToWorkspace(dom, workspace);
+      } catch(e) {
+        console.warn('Could not restore workspace:', e);
+      }
+    }
+  });
+
+  // Forward run/stop status updates from Python
+  bridge.statusChanged.connect(function(msg) {
+    document.getElementById('runStatus').textContent = msg;
+  });
+
+  bridge.messageChanged.connect(function(msg) {
+    document.getElementById('lastMsg').textContent = msg;
+  });
+});
+
+// Send workspace to Python whenever it changes
+workspace.addChangeListener(function(event) {
+  if (event.isUiEvent) return;
+  const xml = Blockly.Xml.domToText(Blockly.Xml.workspaceToDom(workspace));
+  const json = JSON.stringify(workspaceToJson());
+  document.getElementById('blockCount').textContent = workspace.getAllBlocks(false).length;
+  if (bridge) {
+    bridge.on_workspace_change(xml, json);
+  }
+});
+
+// Convert workspace to a simple JSON structure Python can execute
+function workspaceToJson() {
+  const topBlocks = workspace.getTopBlocks(true);
+  return { stacks: topBlocks.map(blockToObj) };
+}
+
+function blockToObj(block) {
+  if (!block) return null;
+  const obj = {
+    type: block.type,
+    id:   block.id,
+    fields: {},
+    inputs: {},
+    next: null,
+  };
+  // fields
+  block.inputList.forEach(input => {
+    input.fieldRow.forEach(field => {
+      if (field.name) obj.fields[field.name] = field.getValue();
+    });
+  });
+  // value inputs (reporters plugged in)
+  block.inputList.forEach(input => {
+    // Blockly v10: Blockly.inputTypes.VALUE === 1, STATEMENT === 3
+    if (input.type === Blockly.inputTypes.VALUE && input.connection && input.connection.targetBlock()) {
+      obj.inputs[input.name] = blockToObj(input.connection.targetBlock());
+    }
+    if (input.type === Blockly.inputTypes.STATEMENT && input.connection && input.connection.targetBlock()) {
+      obj.inputs[input.name + '_BODY'] = blockToObj(input.connection.targetBlock());
+    }
+  });
+  // next
+  if (block.nextConnection && block.nextConnection.targetBlock()) {
+    obj.next = blockToObj(block.nextConnection.targetBlock());
+  }
+  return obj;
+}
+
+// ── Python-callable functions (invoked via bridge slots) ─────────────────
+function clearWorkspace() {
+  workspace.clear();
+}
+
+function loadXml(xml) {
+  workspace.clear();
+  try {
+    const dom = Blockly.Xml.textToDom(xml);
+    Blockly.Xml.domToWorkspace(dom, workspace);
+  } catch(e) {
+    console.error('loadXml error:', e);
+  }
+}
+
+function getXml() {
+  return Blockly.Xml.domToText(Blockly.Xml.workspaceToDom(workspace));
+}
+
+function setRunStatus(msg) {
+  document.getElementById('runStatus').textContent = msg;
+}
+</script>
+</body>
+</html>

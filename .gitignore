@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bundled third-party software distributions (large binaries)
+doc/instruments/OWON_SP_SPE_PCsoftware/DC Power Supply Control_v1.6.0_20220919_x64/
+doc/instruments/OWON_SP_SPE_PCsoftware/USB-SERIAL_Install_Windows_v3_4/
+
+# specstory session files
+.specstory/
