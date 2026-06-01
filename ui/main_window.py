@@ -24,6 +24,8 @@ from .lmg450_panel import LMG450Panel
 from .uart_config_dialog import UartConfigDialog, SerialConfig
 from .dashboard_panel import DashboardPanel
 from .dsp7000_panel import DSP7000Panel
+from .uart_terminal_panel import UartTerminalPanel
+from .ai_panel import AIPanel
 
 _DARK   = "#1A1A2A"
 _CARD   = "#252535"
@@ -56,20 +58,15 @@ QSplitter::handle {{ background: #333355; }}
 class _InstrumentConn(QObject):
     """
     Holds serial config for one instrument and handles connect / disconnect.
-    Emits `status_changed` whenever the connection state changes so a
-    status strip (or anything else) can refresh itself.
-
-    status_changed(text, colour) where:
-      text   = "Simulation" | "Connected" | "Disconnected"
-      colour = hex string
+    Emits `status_changed(text, colour_hex)` whenever the connection state changes.
     """
 
-    status_changed = Signal(str, str)   # (text, colour_hex)
+    status_changed = Signal(str, str)   # (text, colour_hex) — "Connected" | "Disconnected"
 
     def __init__(self, device, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._device     = device
-        self._serial_cfg = SerialConfig(simulate=True)
+        self._serial_cfg = SerialConfig()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -83,10 +80,7 @@ class _InstrumentConn(QObject):
     def do_connect(self) -> bool:
         ok, info = self._device.connect_with_config(self._serial_cfg)
         if ok:
-            if self._device.is_simulated:
-                self.status_changed.emit("Simulation", "#FF9800")
-            else:
-                self.status_changed.emit("Connected", "#4CAF50")
+            self.status_changed.emit("Connected", "#4CAF50")
         else:
             self._emit_disconnected()
             return False
@@ -100,10 +94,7 @@ class _InstrumentConn(QObject):
         """connect and show QMessageBox on failure."""
         ok, info = self._device.connect_with_config(self._serial_cfg)
         if ok:
-            if self._device.is_simulated:
-                self.status_changed.emit("Simulation", "#FF9800")
-            else:
-                self.status_changed.emit("Connected", "#4CAF50")
+            self.status_changed.emit("Connected", "#4CAF50")
         else:
             self._emit_disconnected()
             QMessageBox.warning(parent_widget, "Connection Failed",
@@ -174,9 +165,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(_APP_STYLESHEET)
 
         # ── instruments ───────────────────────────────────────────────────────
-        self._device = HantekRLC1733C(simulate=True)
-        self._psu    = OwonSP3103(simulate=True)
-        self._lmg    = LMG450(simulate=True)
+        self._device = HantekRLC1733C()
+        self._psu    = OwonSP3103()
+        self._lmg    = LMG450()
         self._dsp    = MagtrolDSP7000()
 
         # ── connection helpers (hold serial config, no UI) ────────────────────
@@ -202,14 +193,14 @@ class MainWindow(QMainWindow):
         try:
             d = cfg.get("serial") or {}
             self._lcr_conn.set_serial_config(
-                SerialConfig.from_dict(d) if d else SerialConfig(simulate=True))
+                SerialConfig.from_dict(d) if d else SerialConfig())
         except Exception:
             pass
 
         try:
             d = cfg.get("psu_serial") or {}
             self._psu_conn.set_serial_config(
-                SerialConfig.from_dict(d) if d else SerialConfig(simulate=True))
+                SerialConfig.from_dict(d) if d else SerialConfig())
         except Exception:
             pass
 
@@ -217,7 +208,7 @@ class MainWindow(QMainWindow):
             d = cfg.get("lmg_serial") or {}
             self._lmg_conn.set_serial_config(
                 SerialConfig.from_dict(d) if d else
-                SerialConfig(simulate=True, baudrate=57600))
+                SerialConfig(baudrate=57600))
         except Exception:
             pass
 
@@ -225,7 +216,7 @@ class MainWindow(QMainWindow):
             d = cfg.get("dsp_serial") or {}
             self._dsp_conn.set_serial_config(
                 SerialConfig.from_dict(d) if d else
-                SerialConfig(simulate=True, baudrate=9600))
+                SerialConfig(baudrate=9600))
         except Exception:
             pass
 
@@ -278,7 +269,7 @@ class MainWindow(QMainWindow):
         self._dsp_panel = DSP7000Panel(self._dsp)
         left.addTab(self._dsp_panel, "⚙  DSP7000")
 
-        self._log_panel = LogPanel(self._device)
+        self._log_panel = LogPanel(self._device, self._psu, self._lmg, self._dsp)
         left.addTab(self._log_panel, "📋  Data Log")
 
         splitter.addWidget(left)
@@ -290,6 +281,17 @@ class MainWindow(QMainWindow):
         right_tabs.addTab(self._scratch, "🔧  Blockly")
         right_tabs.addTab(self._dashboard, "📊  Dashboard")
 
+        self._uart_terminal = UartTerminalPanel({
+            "Hantek RLC 1733C":  self._device,
+            "OWON SP3103":       self._psu,
+            "ZES Zimmer LMG450": self._lmg,
+            "Magtrol DSP7000":   self._dsp,
+        })
+        right_tabs.addTab(self._uart_terminal, "🖥  UART Terminal")
+
+        self._ai_panel = AIPanel(blockly_canvas=self._scratch)
+        right_tabs.addTab(self._ai_panel, "🤖  AI Assistant")
+
         splitter.addWidget(right_tabs)
 
         splitter.setSizes([420, 980])
@@ -297,7 +299,7 @@ class MainWindow(QMainWindow):
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage("Ready  |  Simulation mode active")
+        self._status.showMessage("Ready")
 
     # ── menus ─────────────────────────────────────────────────────────────────
 
@@ -447,7 +449,17 @@ class MainWindow(QMainWindow):
 
     # ── Blockly actions ───────────────────────────────────────────────────────
 
+    def _set_instrument_polling(self, active: bool) -> None:
+        """Pause or resume all instrument panel timers (but not the log timer)."""
+        for panel in (self._meas_panel, self._psu_panel,
+                      self._lmg_panel, self._dsp_panel):
+            if active:
+                panel._timer.start(500)
+            else:
+                panel._timer.stop()
+
     def _run_program(self) -> None:
+        self._set_instrument_polling(False)
         prog = self._scratch.get_program_dict()
         self._executor.run(prog)
         self._scratch.set_run_status("Running…")
@@ -455,6 +467,7 @@ class MainWindow(QMainWindow):
 
     def _stop_program(self) -> None:
         self._executor.stop()
+        self._set_instrument_polling(True)
         self._scratch.set_run_status("Idle")
         self._status.showMessage("Program stopped.")
 
@@ -526,7 +539,7 @@ class MainWindow(QMainWindow):
                 self._device.disconnect()
             self._lcr_conn.do_connect_with_warning(self)
             self._status.showMessage(
-                f"LCR serial port: {dlg.config.port or 'simulation'}  {dlg.config.baudrate}")
+                f"LCR serial port: {dlg.config.port}  {dlg.config.baudrate}")
 
     def _lcr_connect(self) -> None:
         if not self._device.connected:
@@ -547,7 +560,7 @@ class MainWindow(QMainWindow):
                 self._psu.disconnect()
             self._psu_conn.do_connect_with_warning(self)
             self._status.showMessage(
-                f"PSU serial port: {dlg.config.port or 'simulation'}  {dlg.config.baudrate}")
+                f"PSU serial port: {dlg.config.port}  {dlg.config.baudrate}")
 
     def _psu_connect(self) -> None:
         if not self._psu.connected:
@@ -575,7 +588,7 @@ class MainWindow(QMainWindow):
                 self._lmg.disconnect()
             self._lmg_conn.do_connect_with_warning(self)
             self._status.showMessage(
-                f"LMG serial port: {dlg.config.port or 'simulation'}  {dlg.config.baudrate}")
+                f"LMG serial port: {dlg.config.port}  {dlg.config.baudrate}")
 
     def _lmg_connect(self) -> None:
         if not self._lmg.connected:
@@ -599,13 +612,13 @@ class MainWindow(QMainWindow):
 
     def _open_dsp_uart_config(self) -> None:
         from .uart_config_dialog import UartConfigDialog as _UCD
-        cfg = self._dsp_conn.serial_cfg or SerialConfig(simulate=True, baudrate=9600)
+        cfg = self._dsp_conn.serial_cfg or SerialConfig(baudrate=9600)
         dlg = _UCD(cfg, parent=self)
         if dlg.exec():
             self._dsp_conn.set_serial_config(dlg.config)
             self._dsp_conn.do_connect_with_warning(self)
             self._status.showMessage(
-                f"DSP7000 serial port: {dlg.config.port or 'simulation'}  {dlg.config.baudrate}")
+                f"DSP7000 serial port: {dlg.config.port}  {dlg.config.baudrate}")
 
     def _dsp_connect(self) -> None:
         self._dsp_conn.do_connect_with_warning(self)
@@ -687,6 +700,7 @@ class MainWindow(QMainWindow):
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
+        self._set_instrument_polling(False)
         self._executor.stop()
         self._config.set("program",    self._scratch.get_program_dict_for_save())
         self._config.set("device",     self._device.get_config())

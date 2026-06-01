@@ -1,74 +1,74 @@
 """
-Hantek RLC 1733C driver.
+Hantek RLC 1733C / 1832C / 1833C LCR Meter driver.
 
-Communication: USB-HID (Vendor ID 0x0483, Product ID 0x5740 typical) or USB-CDC serial.
-The 1733C enumerates as a USB HID device. Each 64-byte report encodes measurement data.
+Communication: USB CDC virtual serial port.
+  The device appears as a standard COM port (VID=0x0483, PID=0x5740).
+  Baud rate is irrelevant for USB CDC, but 9600 is used for compatibility.
 
-Report structure (read, 64 bytes):
-  [0]  Report ID (always 0)
-  [1]  Status: 0x00=ok, 0x01=overload, 0x02=underload
-  [2]  Primary function code (see MeasureMode)
-  [3]  Secondary function code
-  [4]  Frequency index (see TestFrequency)
-  [5]  Range index
-  [6]  Flags (bit0=hold, bit1=rel, bit2=beep)
-  [7-10]  Primary value as IEEE-754 float (little-endian)
-  [11-14] Secondary value as IEEE-754 float (little-endian)
-  [15-18] Phase angle as IEEE-754 float (little-endian)
-  [19]  Primary unit string index
-  [20]  Secondary unit string index
+Protocol: SCPI text commands, terminated with <LF> (0x0A) or <CR><LF>.
+  The device sends responses terminated with <CR><LF>.
 
-Write report (command, 64 bytes):
-  [0]  Report ID
-  [1]  Command (0x01=set_mode, 0x02=set_freq, 0x03=set_range, 0x04=hold, 0x05=rel, 0x06=beep)
-  [2]  Argument byte
-  [3..63] 0x00
+Supported commands (Chapter 4, manual V1.0.2):
+  *IDN?                               → <model>,<sw_ver>,<serial>,<hw_ver>
+  *GTL                                → unlock front-panel keyboard
+  FREQuency <hz>                      → set frequency
+  FREQuency?                          → query frequency (returns integer Hz)
+  FUNCtion:impa <R|L|C|Z|Auto>       → set main parameter
+  FUNCtion:impa?                      → query main parameter
+  FUNCtion:impb <X|Q|D|THETA|ESR>    → set secondary parameter
+  FUNCtion:impb?                      → query secondary parameter
+  FUNCtion:RANGe <AUTO|10|100|1000|10000|100000>
+  FUNCtion:RANGe?
+  FUNCtion:LEVel <300|600>            → set signal level (mVrms)
+  FUNCtion:LEVel?
+  FUNCtion:EQUivalent <SER|PAL>       → set equivalent mode
+  FUNCtion:EQUivalent?
+  FETCh?                              → <NR3>,<NR3>,<NR1>
+                                         primary value, secondary value, range index
 """
 
 from __future__ import annotations
 
-import struct
 import time
 import math
-import random
 import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable, Optional
 
-# USB identifiers – may vary by firmware revision
-_VENDOR_ID = 0x0483
-_PRODUCT_IDS = (0x5740, 0x0001)  # try both
 
-# Serial fallback settings (USB-CDC)
-_SERIAL_BAUD = 9600
-_SERIAL_TIMEOUT = 0.5
+# USB identifiers for auto-discovery via serial port list
+_VENDOR_ID  = 0x0483
+_PRODUCT_ID = 0x5740
+
+_SERIAL_BAUD    = 9600   # nominal; USB CDC ignores baud rate
+_SERIAL_TIMEOUT = 0.5    # seconds — keep short so lock contention doesn't stall the UI
 
 
 class MeasureMode(IntEnum):
-    Ls = 0x01   # Inductance series
-    Lp = 0x02   # Inductance parallel
-    Cs = 0x03   # Capacitance series
-    Cp = 0x04   # Capacitance parallel
-    Rs = 0x05   # Resistance series
-    Rp = 0x06   # Resistance parallel
-    Z  = 0x07   # Impedance
-    D  = 0x08   # Dissipation factor
-    Q  = 0x09   # Quality factor
-    Theta = 0x0A  # Phase angle
-    ESR = 0x0B  # Equivalent series resistance
-    DCR = 0x0C  # DC resistance
+    Ls    = 0x01   # Inductance, series equivalent
+    Lp    = 0x02   # Inductance, parallel equivalent
+    Cs    = 0x03   # Capacitance, series equivalent
+    Cp    = 0x04   # Capacitance, parallel equivalent
+    Rs    = 0x05   # Resistance, series
+    Rp    = 0x06   # Resistance, parallel
+    Z     = 0x07   # Impedance
+    D     = 0x08   # Dissipation factor (C main)
+    Q     = 0x09   # Quality factor (L main)
+    Theta = 0x0A   # Phase angle (Z main)
+    ESR   = 0x0B   # Equivalent series resistance (C main)
+    DCR   = 0x0C   # DC resistance
 
 
 class TestFrequency(IntEnum):
-    F100Hz   = 0
-    F120Hz   = 1
-    F1kHz    = 2
-    F10kHz   = 3
-    F100kHz  = 4
+    F100Hz  = 0
+    F120Hz  = 1
+    F1kHz   = 2
+    F10kHz  = 3
+    F100kHz = 4
 
     @property
-    def hz(self) -> float:
+    def hz(self) -> int:
         return (100, 120, 1000, 10000, 100000)[self.value]
 
     @property
@@ -76,22 +76,43 @@ class TestFrequency(IntEnum):
         return ("100 Hz", "120 Hz", "1 kHz", "10 kHz", "100 kHz")[self.value]
 
 
-_PRIMARY_UNITS = ["H", "H", "F", "F", "Ω", "Ω", "Ω", "—", "—", "°", "Ω", "Ω"]
-_SECONDARY_UNITS = ["D", "Q", "D", "Q", "Q", "D", "Q", "R", "D", "Z", "Z", "Z"]
+# SCPI command mappings for each mode
+# (impa_cmd, impb_cmd, equiv_cmd or None)
+_MODE_SCPI: dict[MeasureMode, tuple[str, str, str | None]] = {
+    MeasureMode.Ls:    ("L",    "Q",     "SER"),
+    MeasureMode.Lp:    ("L",    "Q",     "PAL"),
+    MeasureMode.Cs:    ("C",    "D",     "SER"),
+    MeasureMode.Cp:    ("C",    "D",     "PAL"),
+    MeasureMode.Rs:    ("R",    "Q",     "SER"),
+    MeasureMode.Rp:    ("R",    "Q",     "PAL"),
+    MeasureMode.Z:     ("Z",    "THETA", None),
+    MeasureMode.D:     ("C",    "D",     None),
+    MeasureMode.Q:     ("L",    "Q",     None),
+    MeasureMode.Theta: ("Z",    "THETA", None),
+    MeasureMode.ESR:   ("C",    "ESR",   None),
+    MeasureMode.DCR:   ("R",    "D",     None),
+}
 
-_MODE_PREFIXES = {
-    MeasureMode.Ls: "Ls",
-    MeasureMode.Lp: "Lp",
-    MeasureMode.Cs: "Cs",
-    MeasureMode.Cp: "Cp",
-    MeasureMode.Rs: "Rs",
-    MeasureMode.Rp: "Rp",
-    MeasureMode.Z:  "Z",
-    MeasureMode.D:  "D",
-    MeasureMode.Q:  "Q",
+# Indexed by MeasureMode.value - 1  (Ls=0 … DCR=11)
+# Primary unit reflects impa: L→H, C→F, R/Z→Ω
+# Secondary unit reflects impb: Q→Q, D→D, THETA→°, ESR→Ω
+_PRIMARY_UNITS   = ["H", "H", "F", "F", "Ω", "Ω", "Ω", "F", "H", "Ω", "F", "Ω"]
+#                   Ls   Lp   Cs   Cp   Rs   Rp   Z    D    Q   Th  ESR  DCR
+_SECONDARY_UNITS = ["Q", "Q", "D", "D", "Q", "Q", "°", "D", "Q", "°", "Ω", "D"]
+
+_MODE_LABELS = {
+    MeasureMode.Ls:    "Ls",
+    MeasureMode.Lp:    "Lp",
+    MeasureMode.Cs:    "Cs",
+    MeasureMode.Cp:    "Cp",
+    MeasureMode.Rs:    "Rs",
+    MeasureMode.Rp:    "Rp",
+    MeasureMode.Z:     "Z",
+    MeasureMode.D:     "D",
+    MeasureMode.Q:     "Q",
     MeasureMode.Theta: "θ",
-    MeasureMode.ESR: "ESR",
-    MeasureMode.DCR: "DCR",
+    MeasureMode.ESR:   "ESR",
+    MeasureMode.DCR:   "DCR",
 }
 
 
@@ -101,7 +122,8 @@ def _eng(value: float, unit: str) -> str:
         return f"0.000 {unit}"
     exp = int(math.floor(math.log10(abs(value)) / 3) * 3)
     exp = max(-12, min(12, exp))
-    prefixes = {-12: "p", -9: "n", -6: "µ", -3: "m", 0: "", 3: "k", 6: "M", 9: "G", 12: "T"}
+    prefixes = {-12: "p", -9: "n", -6: "µ", -3: "m", 0: "",
+                3: "k", 6: "M", 9: "G", 12: "T"}
     prefix = prefixes.get(exp, "")
     scaled = value / (10 ** exp)
     return f"{scaled:.4g} {prefix}{unit}"
@@ -109,14 +131,14 @@ def _eng(value: float, unit: str) -> str:
 
 @dataclass
 class Measurement:
-    mode: MeasureMode
+    mode:      MeasureMode
     frequency: TestFrequency
-    primary: float
+    primary:   float
     secondary: float
-    phase: float
-    overload: bool = False
-    hold: bool = False
-    rel: bool = False
+    phase:     float          # degrees; equals secondary when in Theta mode
+    overload:  bool  = False
+    hold:      bool  = False
+    rel:       bool  = False
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -141,208 +163,150 @@ class Measurement:
 
     @property
     def mode_label(self) -> str:
-        return _MODE_PREFIXES.get(self.mode, str(self.mode))
+        return _MODE_LABELS.get(self.mode, str(self.mode))
 
 
-class _SimulatedDevice:
-    """Generates realistic fake measurements for demo/testing without hardware."""
+class _SerialLCR:
+    """Low-level SCPI serial transport."""
 
-    def __init__(self) -> None:
-        self._mode = MeasureMode.Cs
-        self._freq = TestFrequency.F1kHz
-        self._hold = False
-        self._hold_meas: Optional[Measurement] = None
-        self._t0 = time.time()
-
-    def set_mode(self, mode: MeasureMode) -> None:
-        self._mode = mode
-
-    def set_frequency(self, freq: TestFrequency) -> None:
-        self._freq = freq
-
-    def set_hold(self, hold: bool) -> None:
-        self._hold = hold
-        if hold:
-            self._hold_meas = self._generate()
-
-    def read(self) -> Measurement:
-        if self._hold and self._hold_meas:
-            return self._hold_meas
-        return self._generate()
-
-    def _generate(self) -> Measurement:
-        t = time.time() - self._t0
-        noise = lambda: 1 + 0.005 * random.gauss(0, 1)
-
-        if self._mode in (MeasureMode.Cs, MeasureMode.Cp):
-            primary = 100e-9 * noise()   # 100 nF cap
-            secondary = 0.02 * noise()   # D=0.02
-        elif self._mode in (MeasureMode.Ls, MeasureMode.Lp):
-            primary = 10e-3 * noise()    # 10 mH inductor
-            secondary = 50 * noise()     # Q=50
-        elif self._mode in (MeasureMode.Rs, MeasureMode.Rp, MeasureMode.DCR):
-            primary = 1000 * noise()     # 1 kΩ
-            secondary = 0.001 * noise()
-        elif self._mode == MeasureMode.Z:
-            primary = 1000 * noise()
-            secondary = 50 * noise()     # Q
-        elif self._mode == MeasureMode.ESR:
-            primary = 0.5 * noise()      # 0.5 Ω ESR
-            secondary = 100e-9 * noise()
-        elif self._mode == MeasureMode.Q:
-            primary = 50 * noise()
-            secondary = 10e-3 * noise()
-        elif self._mode == MeasureMode.D:
-            primary = 0.02 * noise()
-            secondary = 100e-9 * noise()
-        elif self._mode == MeasureMode.Theta:
-            primary = -45 + 2 * math.sin(t * 0.1)
-            secondary = 1000 * noise()
-        else:
-            primary = 1.0 * noise()
-            secondary = 0.0
-
-        return Measurement(
-            mode=self._mode,
-            frequency=self._freq,
-            primary=primary,
-            secondary=secondary,
-            phase=-45.0,
+    def __init__(self, port: str, baudrate: int = _SERIAL_BAUD,
+                 timeout: float = _SERIAL_TIMEOUT, log=None) -> None:
+        import serial
+        self._ser = serial.Serial(
+            port=port, baudrate=baudrate,
+            bytesize=8, parity="N", stopbits=1,
+            timeout=timeout,
         )
+        self._log = log
+        time.sleep(0.1)
+        self._ser.reset_input_buffer()
+
+    def write(self, cmd: str) -> None:
+        cmd = cmd.strip()
+        self._ser.write((cmd + "\n").encode())
+        if self._log:
+            self._log("TX", cmd)
+
+    def query(self, cmd: str) -> str:
+        # Flush stale bytes from any prior timeout before sending the new command
+        self._ser.reset_input_buffer()
+        self.write(cmd)
+        raw = self._ser.readline().decode(errors="replace").strip()
+        if self._log:
+            self._log("RX", raw)
+        return raw
+
+    def close(self) -> None:
+        try:
+            self._ser.close()
+        except Exception:
+            pass
 
 
 class HantekRLC1733C:
     """
-    Driver for the Hantek RLC 1733C LCR meter.
+    Driver for the Hantek RLC 1733C / 1832C / 1833C LCR meter.
 
-    Tries USB-HID first, falls back to USB-CDC serial, then simulation mode.
-    Pass a SerialConfig (from ui.uart_config_dialog) to connect_with_config()
-    to use an explicit port instead of auto-discovery.
+    The instrument communicates via USB CDC virtual serial port using SCPI.
+    Auto-discovery looks for VID=0x0483, PID=0x5740 on any COM port.
+    An explicit port can be passed via connect_with_config().
     """
 
-    def __init__(self, simulate: bool = False) -> None:
-        self._simulate = simulate
-        self._hid_dev = None
-        self._serial_dev = None
-        self._sim = _SimulatedDevice()
-        self._mode = MeasureMode.Cs
-        self._freq = TestFrequency.F1kHz
-        self._lock = threading.Lock()
-        self._connected = False
-        self._serial_config: Optional[dict] = None   # last applied SerialConfig dict
-        self._connection_info: str = ""              # human-readable description
+    def __init__(self) -> None:
+        self._dev:   Optional[_SerialLCR] = None
+        self._lock   = threading.Lock()
+        self._connected   = False
+        self._log_cb      = None
+        self._serial_config: Optional[dict] = None
+        self._connection_info: str = ""
 
-        self._poll_thread: Optional[threading.Thread] = None
-        self._polling = False
+        self._mode   = MeasureMode.Cs
+        self._freq   = TestFrequency.F1kHz
+        self._hold   = False
+        self._held_meas: Optional[Measurement] = None
+
+        self._poll_thread:  Optional[threading.Thread] = None
+        self._poll_stop     = threading.Event()
         self._poll_interval = 0.5
         self._callbacks: list[Callable[[Measurement], None]] = []
 
-    # ── connection ──────────────────────────────────────────────────────────
+    # ── logging ──────────────────────────────────────────────────────────────
+
+    def set_log_callback(self, cb) -> None:
+        self._log_cb = cb
+
+    def _log(self, direction: str, text: str) -> None:
+        if self._log_cb:
+            try:
+                self._log_cb(direction, text)
+            except Exception:
+                pass
+
+    # ── connection ────────────────────────────────────────────────────────────
 
     def connect_with_config(self, serial_cfg) -> tuple[bool, str]:
         """
-        Connect using an explicit SerialConfig (from UartConfigDialog).
-
-        Returns (success, description) where description says what connected.
+        Connect using a SerialConfig. Tries the specified port first;
+        if no port given, auto-discovers by VID/PID.
+        Returns (success, info_string).
         """
         self.disconnect()
         port     = getattr(serial_cfg, "port", "") or ""
         baudrate = getattr(serial_cfg, "baudrate", _SERIAL_BAUD)
-        bytesize = getattr(serial_cfg, "bytesize", 8)
-        parity   = getattr(serial_cfg, "parity", "N")
-        stopbits = getattr(serial_cfg, "stopbits", 1.0)
-        timeout  = getattr(serial_cfg, "timeout", _SERIAL_TIMEOUT)
-        simulate_fallback = getattr(serial_cfg, "simulate", True)
-
+        timeout  = getattr(serial_cfg, "timeout",  _SERIAL_TIMEOUT)
         self._serial_config = serial_cfg.to_dict() if hasattr(serial_cfg, "to_dict") else {}
 
         if port:
-            # Try HID first on that port (VID/PID via HID)
-            try:
-                import hid
-                for pid in _PRODUCT_IDS:
-                    try:
-                        dev = hid.device()
-                        dev.open(_VENDOR_ID, pid)
-                        dev.set_nonblocking(False)
-                        self._hid_dev = dev
-                        self._connected = True
-                        self._simulate = False
-                        self._connection_info = f"USB-HID  VID={_VENDOR_ID:#06x} PID={pid:#06x}"
-                        return True, self._connection_info
-                    except OSError:
-                        pass
-            except ImportError:
-                pass
+            return self._try_connect(port, baudrate, timeout)
 
-            # Try explicit serial port
-            try:
-                import serial
-                s = serial.Serial(
-                    port=port, baudrate=baudrate,
-                    bytesize=bytesize, parity=parity,
-                    stopbits=stopbits, timeout=timeout,
-                )
-                self._serial_dev = s
-                self._connected = True
-                self._simulate = False
-                self._connection_info = f"{port}  {baudrate} {bytesize}{parity}{stopbits}"
-                return True, self._connection_info
-            except Exception as e:
-                if not simulate_fallback:
-                    return False, str(e)
+        # Auto-discover by VID/PID
+        auto_port = self._find_port()
+        if auto_port:
+            return self._try_connect(auto_port, baudrate, timeout)
 
-        # No port or serial failed → simulation fallback
-        if simulate_fallback or not port:
-            self._simulate = True
-            self._connected = True
-            self._connection_info = "Simulation"
-            return True, self._connection_info
-
-        return False, "Could not connect"
+        return False, "Device not found — connect via USB and select COM port"
 
     def connect(self) -> bool:
-        if self._simulate:
-            self._connected = True
-            self._connection_info = "Simulation"
-            return True
-        # Try HID auto-discovery
-        try:
-            import hid
-            for pid in _PRODUCT_IDS:
-                try:
-                    dev = hid.device()
-                    dev.open(_VENDOR_ID, pid)
-                    dev.set_nonblocking(False)
-                    self._hid_dev = dev
-                    self._connected = True
-                    self._connection_info = f"USB-HID  VID={_VENDOR_ID:#06x} PID={pid:#06x}"
-                    return True
-                except OSError:
-                    pass
-        except ImportError:
-            pass
+        """Auto-discover and connect. Returns True on success."""
+        port = self._find_port()
+        if port:
+            ok, _ = self._try_connect(port)
+            return ok
+        return False
 
-        # Try serial auto-discovery (USB-CDC Hantek device)
+    def _find_port(self) -> str:
+        """Scan serial ports for VID=0x0483 PID=0x5740 and return device name."""
         try:
-            import serial
             import serial.tools.list_ports
-            for port in serial.tools.list_ports.comports():
-                vid_hex = f"{port.vid:04X}" if port.vid else ""
-                if "0483" in vid_hex or "hantek" in (port.description or "").lower():
-                    self._serial_dev = serial.Serial(
-                        port.device, _SERIAL_BAUD, timeout=_SERIAL_TIMEOUT)
-                    self._connected = True
-                    self._connection_info = f"{port.device}  {_SERIAL_BAUD} 8N1 (auto)"
-                    return True
+            for p in serial.tools.list_ports.comports():
+                if p.vid == _VENDOR_ID and p.pid == _PRODUCT_ID:
+                    return p.device
+                # Fallback: match by description string
+                desc = (p.description or "").lower()
+                if "hantek" in desc or "lcr" in desc:
+                    return p.device
         except Exception:
             pass
+        return ""
 
-        # Fall back to simulation
-        self._simulate = True
-        self._connected = True
-        self._connection_info = "Simulation (no device found)"
-        return True  # always succeeds (simulation)
+    def _try_connect(self, port: str, baudrate: int = _SERIAL_BAUD,
+                     timeout: float = _SERIAL_TIMEOUT) -> tuple[bool, str]:
+        try:
+            dev = _SerialLCR(port, baudrate, timeout, log=self._log)
+            idn = dev.query("*IDN?")
+            if not idn:
+                dev.close()
+                return False, f"{port}: no response to *IDN?"
+            self._dev = dev
+            self._connected = True
+            self._connection_info = f"{port}  {baudrate} bps  |  {idn}"
+            return True, self._connection_info
+        except Exception as e:
+            return False, str(e)
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
 
     @property
     def connection_info(self) -> str:
@@ -351,98 +315,145 @@ class HantekRLC1733C:
     def disconnect(self) -> None:
         self.stop_polling()
         with self._lock:
-            if self._hid_dev:
+            if self._dev:
                 try:
-                    self._hid_dev.close()
+                    self._dev.write("*GTL")   # release keyboard lock
                 except Exception:
                     pass
-                self._hid_dev = None
-            if self._serial_dev:
-                try:
-                    self._serial_dev.close()
-                except Exception:
-                    pass
-                self._serial_dev = None
+                self._dev.close()
+                self._dev = None
             self._connected = False
 
-    @property
-    def connected(self) -> bool:
-        return self._connected
-
-    @property
-    def is_simulated(self) -> bool:
-        return self._simulate
-
-    # ── configuration ────────────────────────────────────────────────────────
+    # ── instrument configuration ──────────────────────────────────────────────
 
     def set_mode(self, mode: MeasureMode) -> None:
         self._mode = mode
-        if self._simulate:
-            self._sim.set_mode(mode)
-            return
-        self._write_command(0x01, mode.value)
+        impa, impb, equiv = _MODE_SCPI.get(mode, ("C", "D", None))
+        with self._lock:
+            if self._dev:
+                self._log("TX", f"set_mode {mode.name}")
+                self._dev.write(f"FUNCtion:impa {impa}")
+                self._dev.write(f"FUNCtion:impb {impb}")
+                if equiv:
+                    self._dev.write(f"FUNCtion:EQUivalent {equiv}")
 
     def set_frequency(self, freq: TestFrequency) -> None:
         self._freq = freq
-        if self._simulate:
-            self._sim.set_frequency(freq)
-            return
-        self._write_command(0x02, freq.value)
+        with self._lock:
+            if self._dev:
+                self._log("TX", f"set_frequency {freq.label}")
+                self._dev.write(f"FREQuency {freq.hz}")
 
     def set_hold(self, hold: bool) -> None:
-        if self._simulate:
-            self._sim.set_hold(hold)
-            return
-        self._write_command(0x04, 0x01 if hold else 0x00)
+        self._hold = hold
+        if not hold:
+            self._held_meas = None
+        self._log("TX", f"hold {'ON' if hold else 'OFF'}")
 
     def set_rel(self, rel: bool) -> None:
-        if self._simulate:
-            return
-        self._write_command(0x05, 0x01 if rel else 0x00)
+        self._log("TX", f"rel {'ON' if rel else 'OFF'}")
+        # REL mode is handled on-device; no remote command in this firmware version
+
+    def set_level(self, mv: int) -> None:
+        """Set signal level: 300 or 600 (mVrms)."""
+        with self._lock:
+            if self._dev:
+                self._dev.write(f"FUNCtion:LEVel {mv}")
+
+    def set_range(self, r: str) -> None:
+        """Set range: 'AUTO', '10', '100', '1000', '10000', '100000'."""
+        with self._lock:
+            if self._dev:
+                self._dev.write(f"FUNCtion:RANGe {r}")
 
     def trigger_beep(self) -> None:
-        if self._simulate:
-            return
-        self._write_command(0x06, 0x01)
+        pass   # no SCPI beep command in this device
 
-    # ── measurement ──────────────────────────────────────────────────────────
+    # ── measurement ───────────────────────────────────────────────────────────
+
+    def _default_measurement(self) -> Measurement:
+        return Measurement(mode=self._mode, frequency=self._freq,
+                           primary=0.0, secondary=0.0, phase=0.0)
 
     def measure(self) -> Measurement:
-        with self._lock:
-            if self._simulate:
-                return self._sim.read()
-            if self._hid_dev:
-                return self._read_hid()
-            if self._serial_dev:
-                return self._read_serial()
-        return self._sim.read()
+        if self._hold and self._held_meas is not None:
+            return self._held_meas
 
-    # ── polling ──────────────────────────────────────────────────────────────
+        with self._lock:
+            if not self._dev:
+                return self._default_measurement()
+            try:
+                resp = self._dev.query("FETCh?")
+                m = self._parse_fetch(resp)
+                if self._hold:
+                    self._held_meas = m
+                return m
+            except Exception:
+                return self._default_measurement()
+
+    def _parse_fetch(self, resp: str) -> Measurement:
+        """
+        Parse FETCh? response: '<NR3>,<NR3>,<NR1>'
+        e.g. '1.234567E-04,2.345678E-02,3'
+        """
+        parts = [p.strip() for p in resp.split(",")]
+        overload = False
+
+        try:
+            primary = float(parts[0])
+            # Values ≥ 9.9E+37 indicate overload / out of range
+            if not math.isfinite(primary) or abs(primary) >= 9.9e37:
+                overload = True
+                primary = 0.0
+        except (ValueError, IndexError):
+            overload = True
+            primary = 0.0
+
+        try:
+            secondary = float(parts[1])
+            if not math.isfinite(secondary):
+                secondary = 0.0
+        except (ValueError, IndexError):
+            secondary = 0.0
+
+        # Phase: use secondary value when in theta/Z mode
+        phase = secondary if self._mode in (MeasureMode.Theta, MeasureMode.Z) else 0.0
+
+        return Measurement(
+            mode=self._mode,
+            frequency=self._freq,
+            primary=primary,
+            secondary=secondary,
+            phase=phase,
+            overload=overload,
+            hold=self._hold,
+        )
+
+    # ── polling ───────────────────────────────────────────────────────────────
 
     def add_callback(self, cb: Callable[[Measurement], None]) -> None:
         self._callbacks.append(cb)
 
     def remove_callback(self, cb: Callable[[Measurement], None]) -> None:
-        self._callbacks.discard(cb) if hasattr(self._callbacks, "discard") else None
         if cb in self._callbacks:
             self._callbacks.remove(cb)
 
     def start_polling(self, interval: float = 0.5) -> None:
         self._poll_interval = interval
-        if self._polling:
+        if self._poll_thread and self._poll_thread.is_alive():
             return
-        self._polling = True
+        self._poll_stop.clear()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
 
     def stop_polling(self) -> None:
-        self._polling = False
+        self._poll_stop.set()
         if self._poll_thread:
             self._poll_thread.join(timeout=2)
             self._poll_thread = None
 
     def _poll_loop(self) -> None:
-        while self._polling:
+        while not self._poll_stop.is_set():
             try:
                 m = self.measure()
                 for cb in list(self._callbacks):
@@ -452,76 +463,13 @@ class HantekRLC1733C:
                         pass
             except Exception:
                 pass
-            time.sleep(self._poll_interval)
+            self._poll_stop.wait(self._poll_interval)
 
-    # ── raw I/O ──────────────────────────────────────────────────────────────
-
-    def _write_command(self, cmd: int, arg: int) -> None:
-        buf = bytes([0x00, cmd, arg]) + bytes(61)
-        if self._hid_dev:
-            try:
-                self._hid_dev.write(buf)
-            except Exception:
-                pass
-        elif self._serial_dev:
-            try:
-                self._serial_dev.write(buf)
-            except Exception:
-                pass
-
-    def _read_hid(self) -> Measurement:
-        try:
-            data = self._hid_dev.read(64, timeout_ms=1000)
-            return self._parse_report(data)
-        except Exception:
-            return self._sim.read()
-
-    def _read_serial(self) -> Measurement:
-        try:
-            self._serial_dev.write(bytes([0x00, 0x00, 0x00] + [0] * 61))
-            data = self._serial_dev.read(64)
-            if len(data) >= 19:
-                return self._parse_report(data)
-        except Exception:
-            pass
-        return self._sim.read()
-
-    def _parse_report(self, data: bytes | list) -> Measurement:
-        if len(data) < 19:
-            return self._sim.read()
-        status  = data[1]
-        mode_b  = data[2]
-        freq_b  = data[4]
-        flags   = data[6]
-        primary  = struct.unpack_from("<f", bytes(data), 7)[0]
-        secondary = struct.unpack_from("<f", bytes(data), 11)[0]
-        phase   = struct.unpack_from("<f", bytes(data), 15)[0]
-
-        try:
-            mode = MeasureMode(mode_b)
-        except ValueError:
-            mode = self._mode
-        try:
-            freq = TestFrequency(freq_b)
-        except ValueError:
-            freq = self._freq
-
-        return Measurement(
-            mode=mode,
-            frequency=freq,
-            primary=primary,
-            secondary=secondary,
-            phase=phase,
-            overload=bool(status & 0x01),
-            hold=bool(flags & 0x01),
-            rel=bool(flags & 0x02),
-        )
-
-    # ── config serialisation ─────────────────────────────────────────────────
+    # ── config serialisation ──────────────────────────────────────────────────
 
     def get_config(self) -> dict:
-        cfg = {
-            "mode": self._mode.value,
+        cfg: dict = {
+            "mode":      self._mode.value,
             "frequency": self._freq.value,
         }
         if self._serial_config:

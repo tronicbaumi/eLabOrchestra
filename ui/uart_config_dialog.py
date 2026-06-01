@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QComboBox, QPushButton, QFrame, QLineEdit,
-    QGroupBox, QDialogButtonBox, QMessageBox, QCheckBox,
+    QGroupBox, QDialogButtonBox, QMessageBox,
     QSpinBox,
 )
 
@@ -35,8 +35,6 @@ QComboBox, QLineEdit, QSpinBox {{
 QComboBox::drop-down {{ border: none; width: 20px; }}
 QComboBox QAbstractItemView {{ background: #333350; color: {_TEXT}; selection-background-color: {_ACCENT}; }}
 QLabel {{ color: {_TEXT}; font-size: 9pt; }}
-QCheckBox {{ color: {_TEXT}; font-size: 9pt; }}
-QCheckBox::indicator {{ width: 14px; height: 14px; }}
 """
 
 _BTN_STYLE = """
@@ -57,7 +55,6 @@ class SerialConfig:
     parity:    str   = "N"      # N E O M S
     stopbits:  float = 1.0      # 1 1.5 2
     timeout:   float = 1.0      # seconds
-    simulate:  bool  = False    # use simulation when True or port empty
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -131,6 +128,7 @@ class UartConfigDialog(QDialog):
         self._lbl_port_desc.setStyleSheet(f"color: {_DIM}; font-size: 8pt;")
         pg.addWidget(self._lbl_port_desc, 1, 1, 1, 2)
 
+        self._port_descs: dict[str, str] = {}
         self._combo_port.currentTextChanged.connect(self._on_port_text_changed)
         root.addWidget(port_grp)
 
@@ -180,15 +178,6 @@ class UartConfigDialog(QDialog):
         gg.addWidget(self._spin_timeout, 0, 3)
 
         root.addWidget(param_grp)
-
-        # ── Simulation fallback ──────────────────────────────────────────────
-        sim_grp = QGroupBox("Fallback")
-        sg = QVBoxLayout(sim_grp)
-        sg.setContentsMargins(12, 18, 12, 10)
-        self._chk_simulate = QCheckBox("Use simulation mode when device is not found")
-        self._chk_simulate.setChecked(True)
-        sg.addWidget(self._chk_simulate)
-        root.addWidget(sim_grp)
 
         # ── Test button ──────────────────────────────────────────────────────
         test_row = QHBoxLayout()
@@ -243,7 +232,6 @@ class UartConfigDialog(QDialog):
         self._combo_stop.setCurrentIndex(stop_map.get(float(self._cfg.stopbits), 0))
 
         self._spin_timeout.setValue(int(self._cfg.timeout))
-        self._chk_simulate.setChecked(self._cfg.simulate)
 
     def _scan_ports(self) -> None:
         self._btn_scan.setEnabled(False)
@@ -258,7 +246,7 @@ class UartConfigDialog(QDialog):
         current = self._combo_port.currentText()
         self._combo_port.blockSignals(True)
         self._combo_port.clear()
-        self._port_descs: dict[str, str] = {}
+        self._port_descs.clear()
         for port, desc in ports:
             self._combo_port.addItem(f"{port}  —  {desc}", userData=port)
             self._port_descs[port] = desc
@@ -296,7 +284,6 @@ class UartConfigDialog(QDialog):
             parity   = parity_map[self._combo_parity.currentIndex()],
             stopbits = stop_map[self._combo_stop.currentIndex()],
             timeout  = float(self._spin_timeout.value()),
-            simulate = self._chk_simulate.isChecked(),
         )
 
     def _test_connection(self) -> None:
@@ -322,9 +309,9 @@ class UartConfigDialog(QDialog):
 
     def _on_accept(self) -> None:
         cfg = self._build_config()
-        if not cfg.port and not cfg.simulate:
+        if not cfg.port:
             QMessageBox.warning(self, "No Port",
-                "Please select a serial port or enable simulation fallback.")
+                "Please select a serial port.")
             return
         self._cfg = cfg
         self.accept()

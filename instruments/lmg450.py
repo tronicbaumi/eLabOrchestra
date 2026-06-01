@@ -56,9 +56,7 @@ Multi-channel aggregates:
 
 from __future__ import annotations
 
-import math
 import time
-import random
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -109,171 +107,39 @@ class LMG450State:
     active_chan: int = 1
 
 
-# ── simulated device ──────────────────────────────────────────────────────────
-
-class _SimulatedLMG450:
-    """Physics-inspired simulation of all four channels."""
-
-    def __init__(self) -> None:
-        self._achan  = 1
-        self._avrg   = 1
-        self._t0     = time.time()
-        self._int_running = False
-        self._int_start   = 0.0
-        self._int_energy  = [0.0] * 5   # index 1-4
-        self._int_charge  = [0.0] * 5
-        # Each channel has a slightly different "load"
-        self._loads = [
-            dict(urms=230.0, irms=5.0,  pf=0.97, freq=50.0),   # ch1
-            dict(urms=115.0, irms=10.0, pf=0.85, freq=60.0),   # ch2
-            dict(urms=48.0,  irms=20.0, pf=0.92, freq=50.0),   # ch3
-            dict(urms=400.0, irms=3.0,  pf=0.99, freq=50.0),   # ch4
-        ]
-
-    def _noise(self, scale=0.01):
-        return scale * (random.random() - 0.5)
-
-    def write(self, cmd: str) -> None:
-        cmd = cmd.strip().upper()
-        if cmd.startswith("ACHAN"):
-            try:
-                self._achan = int(cmd.split()[-1])
-            except ValueError:
-                pass
-        elif cmd.startswith("AVRG"):
-            try:
-                self._avrg = int(cmd.split()[-1])
-            except ValueError:
-                pass
-        elif cmd == "STRTITIME":
-            self._int_running = True
-            self._int_start   = time.time()
-        elif cmd == "STPTITIME":
-            if self._int_running:
-                dt = time.time() - self._int_start
-                ld = self._loads[self._achan - 1]
-                p  = ld["urms"] * ld["irms"] * ld["pf"]
-                self._int_energy[self._achan] += p * dt / 3600.0
-                self._int_charge[self._achan] += ld["irms"] * dt / 3600.0
-                self._int_running = False
-        elif cmd == "RSTITIME":
-            self._int_energy[self._achan] = 0.0
-            self._int_charge[self._achan] = 0.0
-            self._int_start = time.time()
-
-    def query(self, cmd: str) -> str:
-        cmd = cmd.strip().upper()
-        ld  = self._loads[self._achan - 1]
-
-        if cmd == "*IDN?":
-            return "ZES ZIMMER,LMG450,SIM000001,FW:V4.2.0"
-        if cmd == "UTRMS?":
-            return f"{ld['urms'] + self._noise(0.05):.4f}"
-        if cmd == "ITRMS?":
-            return f"{ld['irms'] + self._noise(0.02):.5f}"
-        if cmd == "P?":
-            return f"{ld['urms']*ld['irms']*ld['pf'] + self._noise(1.0):.4f}"
-        if cmd == "Q?":
-            pf   = ld["pf"]
-            q    = ld["urms"] * ld["irms"] * math.sqrt(max(0, 1 - pf**2))
-            return f"{q + self._noise(0.5):.4f}"
-        if cmd == "S?":
-            return f"{ld['urms']*ld['irms'] + self._noise(0.5):.4f}"
-        if cmd == "LAMDA?":
-            return f"{ld['pf'] + self._noise(0.001):.5f}"
-        if cmd == "PHI?":
-            phi = math.degrees(math.acos(ld["pf"]))
-            return f"{phi + self._noise(0.05):.4f}"
-        if cmd == "FU?":
-            return f"{ld['freq'] + self._noise(0.01):.4f}"
-        if cmd == "UBDC?":
-            return f"{self._noise(0.1):.5f}"
-        if cmd == "IBDC?":
-            return f"{self._noise(0.005):.6f}"
-
-        # integration
-        if cmd == "WH?":
-            if self._int_running:
-                dt = time.time() - self._int_start
-                p  = ld["urms"] * ld["irms"] * ld["pf"]
-                return f"{self._int_energy[self._achan] + p*dt/3600.0:.6f}"
-            return f"{self._int_energy[self._achan]:.6f}"
-        if cmd == "AH?":
-            if self._int_running:
-                dt = time.time() - self._int_start
-                return f"{self._int_charge[self._achan] + ld['irms']*dt/3600.0:.6f}"
-            return f"{self._int_charge[self._achan]:.6f}"
-        if cmd == "ITIME?":
-            if self._int_running:
-                return f"{time.time() - self._int_start:.2f}"
-            return "0.00"
-
-        # harmonics
-        if cmd.startswith("UHAR") and cmd.endswith("?"):
-            n_str = cmd[4:-1]
-            try:
-                n = int(n_str)
-            except ValueError:
-                return "0"
-            # fundamental = full amplitude, harmonics decay with 1/n
-            amp = ld["urms"] / n if n >= 1 else 0.0
-            return f"{amp * (1 + self._noise(0.05)):.4f}"
-        if cmd.startswith("IHAR") and cmd.endswith("?"):
-            n_str = cmd[4:-1]
-            try:
-                n = int(n_str)
-            except ValueError:
-                return "0"
-            amp = ld["irms"] / n if n >= 1 else 0.0
-            return f"{amp * (1 + self._noise(0.05)):.5f}"
-        if cmd == "UTHD?":
-            return f"{5.2 + self._noise(0.2):.2f}"
-        if cmd == "ITHD?":
-            return f"{8.7 + self._noise(0.3):.2f}"
-
-        # aggregates
-        if cmd == "PSUM?":
-            total = sum(ld["urms"]*ld["irms"]*ld["pf"] for ld in self._loads)
-            return f"{total:.4f}"
-        if cmd == "QSUM?":
-            total = sum(ld["urms"]*ld["irms"]*math.sqrt(max(0,1-ld["pf"]**2)) for ld in self._loads)
-            return f"{total:.4f}"
-        if cmd == "SSUM?":
-            total = sum(ld["urms"]*ld["irms"] for ld in self._loads)
-            return f"{total:.4f}"
-        if cmd == "WPSUM?":
-            return f"{sum(self._int_energy[1:5]):.6f}"
-        if cmd == "AHPSUM?":
-            return f"{sum(self._int_charge[1:5]):.6f}"
-
-        return "0"
-
-    def close(self) -> None:
-        pass
-
-
 # ── real serial transport ─────────────────────────────────────────────────────
 
 class _SerialLMG450:
-    def __init__(self, port: str, baudrate: int = 57600, timeout: float = 2.0):
+    def __init__(self, port: str, baudrate: int = 57600, timeout: float = 2.0,
+                 log=None):
         import serial
         self._ser = serial.Serial(
             port=port, baudrate=baudrate, bytesize=8,
             parity="N", stopbits=1, timeout=timeout,
             xonxoff=False, rtscts=False, dsrdtr=False,
         )
+        self._log = log
         time.sleep(0.3)
         self._ser.flushInput()
 
     def write(self, cmd: str) -> None:
-        self._ser.write((cmd.strip() + "\r\n").encode())
+        cmd = cmd.strip()
+        self._ser.write((cmd + "\r\n").encode())
+        if self._log:
+            self._log("TX", cmd)
         time.sleep(0.05)
 
     def query(self, cmd: str) -> str:
         self._ser.flushInput()
-        self.write(cmd)
-        raw = self._ser.readline().decode(errors="replace")
-        return raw.strip()
+        cmd = cmd.strip()
+        self._ser.write((cmd + "\r\n").encode())
+        if self._log:
+            self._log("TX", cmd)
+        time.sleep(0.05)
+        raw = self._ser.readline().decode(errors="replace").strip()
+        if self._log:
+            self._log("RX", raw)
+        return raw
 
     def close(self) -> None:
         self._ser.close()
@@ -286,8 +152,8 @@ class LMG450:
     Driver for the ZES Zimmer LMG450 four-channel power analyser.
 
     Quick-start::
-        lmg = LMG450(simulate=True)
-        ok, info = lmg.connect()
+        lmg = LMG450()
+        ok, info = lmg.connect(port="COM4", baudrate=57600)
         lmg.select_channel(1)
         m = lmg.measure_channel()
         print(m.urms, m.p, m.lamda)
@@ -300,11 +166,11 @@ class LMG450:
     MAX_HARMONIC = 50
     DEFAULT_BAUD = 57600
 
-    def __init__(self, simulate: bool = False) -> None:
-        self._simulate  = simulate
+    def __init__(self) -> None:
         self._dev       = None
         self._lock      = threading.Lock()
         self._connected = False
+        self._log_cb    = None
         self._active_ch = 1
         self._averaging = 1
         self._state     = LMG450State(
@@ -317,52 +183,48 @@ class LMG450:
 
     # ── connection ────────────────────────────────────────────────────────────
 
+    def set_log_callback(self, cb) -> None:
+        """cb(direction: str, message: str) — called for every TX/RX message."""
+        self._log_cb = cb
+
+    def _log(self, direction: str, text: str) -> None:
+        if self._log_cb:
+            try:
+                self._log_cb(direction, text)
+            except Exception:
+                pass
+
     @property
     def connected(self) -> bool:
         return self._connected
 
     @property
-    def is_simulated(self) -> bool:
-        return self._simulate
-
-    @property
     def connection_info(self) -> str:
         if not self._connected:
             return "Disconnected"
-        if self._simulate:
-            return "Simulation (LMG450)"
         return getattr(self, "_port_info", "Serial")
 
     def connect(self, port: str = "", baudrate: int = DEFAULT_BAUD,
                 timeout: float = 2.0) -> tuple[bool, str]:
-        if port and not self._simulate:
-            try:
-                self._dev = _SerialLMG450(port, baudrate, timeout)
-                idn = self._dev.query("*IDN?")
-                self._dev.write("CONT ON")
-                self._port_info = f"{port}  {baudrate} bps  |  {idn}"
-                self._simulate  = False
-                self._connected = True
-                return True, self._port_info
-            except Exception as e:
+        if not port:
+            return False, "No port specified"
+        try:
+            self._dev = _SerialLMG450(port, baudrate, timeout, log=self._log)
+            idn = self._dev.query("*IDN?")
+            if not idn:
+                self._dev.close()
                 self._dev = None
-                if not self._simulate:
-                    return False, str(e)
-        # simulation fallback
-        self._dev       = _SimulatedLMG450()
-        self._simulate  = True
-        self._connected = True
-        return True, "Simulation mode (ZES Zimmer LMG450)"
+                return False, "No response to *IDN? — wrong port or device not ready"
+            self._dev.write("CONT ON")
+            self._port_info = f"{port}  {baudrate} bps  |  {idn}"
+            self._connected = True
+            return True, self._port_info
+        except Exception as e:
+            self._dev = None
+            return False, str(e)
 
     def connect_with_config(self, cfg) -> tuple[bool, str]:
-        if cfg.simulate or not cfg.port:
-            self._simulate = True
-            return self.connect()
-        ok, info = self.connect(port=cfg.port, baudrate=cfg.baudrate, timeout=cfg.timeout)
-        if not ok and cfg.simulate:
-            self._simulate = True
-            return self.connect()
-        return ok, info
+        return self.connect(port=cfg.port, baudrate=cfg.baudrate, timeout=cfg.timeout)
 
     def disconnect(self) -> None:
         self.stop_polling()

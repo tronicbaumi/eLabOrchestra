@@ -69,175 +69,6 @@ class DSP7000State:
         return self.channels[channel - 1]
 
 
-# ── Simulation ─────────────────────────────────────────────────────────────────
-
-class _SimulatedDSP7000:
-    """Physics-realistic dynamometer simulation (single instrument, 2 channels)."""
-
-    def __init__(self) -> None:
-        self._state   = DSP7000State()
-        self._lock    = threading.Lock()
-        # per-channel simulation state
-        self._speed   = [0.0, 0.0]      # actual speed rpm
-        self._torque  = [0.0, 0.0]      # actual torque Nm
-        self._ramp    = [None, None]     # (direction, rate_rpm_s, target_rpm) or None
-        self._t_last  = [time.monotonic(), time.monotonic()]
-        # Dynamometer constants (inertia / friction model)
-        self._J       = 0.005           # kg·m²  (moment of inertia)
-        self._B       = 0.002           # N·m·s/rad (viscous friction)
-        self._Kt      = 0.08            # N·m/% current (torque constant)
-
-    @property
-    def connected(self) -> bool:
-        return True
-
-    def get_state(self) -> DSP7000State:
-        with self._lock:
-            self._update_physics(1)
-            self._update_physics(2)
-            return self._state
-
-    # ── physics ───────────────────────────────────────────────────────────────
-
-    def _update_physics(self, ch: int) -> None:
-        idx   = ch - 1
-        now   = time.monotonic()
-        dt    = min(now - self._t_last[idx], 0.1)
-        self._t_last[idx] = now
-
-        # brake torque from current output
-        T_brake = self._state.current_output[idx] * self._Kt
-
-        # speed mode: approach setpoint
-        if self._state.brake_on[idx]:
-            sp = self._state.speed_setpoint[idx]
-            # first-order approach  (τ = J/B)
-            tau = self._J / (self._B + 1e-6)
-            alpha = math.exp(-dt / tau)
-            self._speed[idx] = sp + (self._speed[idx] - sp) * alpha
-            # torque = brake torque (load) + small noise
-            self._torque[idx] = T_brake * (1.0 + 0.005 * math.sin(now * 7.3))
-        else:
-            # free-run: speed decays due to friction
-            omega = self._speed[idx] * math.pi / 30.0
-            domega = -(self._B / self._J) * omega * dt
-            self._speed[idx] = max(0.0, self._speed[idx] + domega * 30.0 / math.pi)
-            self._torque[idx] = 0.0
-
-        # ramp control
-        if self._ramp[idx] is not None:
-            direction, rate, target = self._ramp[idx]
-            if direction == "up":
-                self._speed[idx] = min(target, self._speed[idx] + rate * dt)
-                if self._speed[idx] >= target:
-                    self._ramp[idx] = None
-            else:
-                self._speed[idx] = max(target, self._speed[idx] - rate * dt)
-                if self._speed[idx] <= target:
-                    self._ramp[idx] = None
-
-        n   = self._speed[idx]
-        T   = self._torque[idx]
-        P   = (2.0 * math.pi * n / 60.0) * T
-
-        cd = self._state.channels[idx]
-        cd.speed     = round(n, 2)
-        cd.torque    = round(T, 4)
-        cd.power     = round(P, 3)
-        cd.direction = "R"
-
-    # ── command handlers ──────────────────────────────────────────────────────
-
-    def identify(self) -> str:
-        return "Magtrol,DSP7000,SN000000,FW3.10 (simulation)"
-
-    def read_channel(self, ch: int) -> ChannelData:
-        with self._lock:
-            self._update_physics(ch)
-            return self._state.ch(ch)
-
-    def set_speed(self, ch: int, rpm: float) -> None:
-        with self._lock:
-            self._state.speed_setpoint[ch - 1] = rpm
-            self._state.brake_on[ch - 1] = True
-
-    def reset_speed(self, ch: int) -> None:
-        with self._lock:
-            self._state.speed_setpoint[ch - 1] = 0.0
-            self._state.brake_on[ch - 1] = False
-
-    def set_torque(self, ch: int, torque: float) -> None:
-        with self._lock:
-            self._state.torque_setpoint[ch - 1] = torque
-            # Map torque setpoint to equivalent current
-            self._state.current_output[ch - 1] = min(99.99, torque / self._Kt)
-            self._state.brake_on[ch - 1] = True
-
-    def reset_torque(self, ch: int) -> None:
-        with self._lock:
-            self._state.torque_setpoint[ch - 1] = 0.0
-            self._state.current_output[ch - 1] = 0.0
-            self._state.brake_on[ch - 1] = False
-
-    def set_current(self, ch: int, pct: float) -> None:
-        with self._lock:
-            self._state.current_output[ch - 1] = max(0.0, min(99.99, pct))
-
-    def reset_channel(self, ch: int) -> None:
-        with self._lock:
-            self._state.brake_on[ch - 1]       = False
-            self._state.speed_setpoint[ch - 1]  = 0.0
-            self._state.torque_setpoint[ch - 1] = 0.0
-            self._state.current_output[ch - 1]  = 0.0
-            self._ramp[ch - 1]                  = None
-
-    def ramp_up(self, ch: int, linear: bool, rate_or_time: float) -> None:
-        with self._lock:
-            rate = rate_or_time if linear else 200.0 / max(0.1, rate_or_time)
-            sp   = self._state.speed_setpoint[ch - 1] or 3000.0
-            self._ramp[ch - 1] = ("up", rate, sp)
-            self._state.brake_on[ch - 1] = True
-
-    def ramp_down(self, ch: int, linear: bool, rate_or_time: float) -> None:
-        with self._lock:
-            rate = rate_or_time if linear else self._speed[ch - 1] / max(0.1, rate_or_time)
-            self._ramp[ch - 1] = ("down", rate, 0.0)
-
-    def abort_ramp(self, ch: int) -> None:
-        with self._lock:
-            self._ramp[ch - 1] = None
-
-    def set_speed_alarm(self, ch: int, rpm: float) -> None:
-        with self._lock:
-            self._state.speed_alarm[ch - 1] = rpm
-
-    def set_torque_alarm(self, ch: int, val: float) -> None:
-        with self._lock:
-            self._state.torque_alarm[ch - 1] = val
-
-    def set_power_alarm(self, ch: int, kw: float) -> None:
-        with self._lock:
-            self._state.power_alarm[ch - 1] = kw
-
-    def set_alarms(self, ch: int, enable: bool) -> None:
-        with self._lock:
-            self._state.alarms_enabled[ch - 1] = enable
-
-    def freeze_pid(self, ch: int, freeze: bool) -> None:
-        with self._lock:
-            self._state.pid_frozen[ch - 1] = freeze
-
-    def tare(self, ch: int, enable: bool) -> None:
-        with self._lock:
-            self._state.tare_active[ch - 1] = enable
-
-    def save(self, ch: int) -> None:
-        pass  # no-op in simulation
-
-    def read_status(self) -> int:
-        return 0  # no alarms in simulation
-
-
 # ── Real serial transport ──────────────────────────────────────────────────────
 
 class _SerialDSP7000:
@@ -245,10 +76,11 @@ class _SerialDSP7000:
 
     _TIMEOUT = 1.0
 
-    def __init__(self, cfg: SerialConfig) -> None:
+    def __init__(self, cfg, log=None) -> None:
         self._cfg  = cfg
         self._port = None
         self._lock = threading.Lock()
+        self._log  = log
 
     def open(self) -> None:
         if not _SERIAL_OK:
@@ -277,11 +109,18 @@ class _SerialDSP7000:
     def query(self, cmd: str) -> str:
         with self._lock:
             self._send(cmd)
-            return self._recv()
+            if self._log:
+                self._log("TX", cmd)
+            resp = self._recv()
+            if self._log:
+                self._log("RX", resp)
+            return resp
 
     def send(self, cmd: str) -> None:
         with self._lock:
             self._send(cmd)
+            if self._log:
+                self._log("TX", cmd)
             # small instruments echo or reply — drain any response
             time.sleep(0.02)
             if self._port.in_waiting:
@@ -315,9 +154,9 @@ class MagtrolDSP7000:
     """
 
     def __init__(self) -> None:
-        self._sim:  _SimulatedDSP7000 = _SimulatedDSP7000()
-        self._real: Optional[_SerialDSP7000] = None
-        self._cfg  = None   # SerialConfig set on first connect_with_config call
+        self._real:    Optional[_SerialDSP7000] = None
+        self._cfg      = None
+        self._log_cb   = None
         self._poll_thread:  Optional[threading.Thread] = None
         self._poll_stop:    threading.Event = threading.Event()
         self._state:        DSP7000State = DSP7000State()
@@ -326,32 +165,39 @@ class MagtrolDSP7000:
 
     # ── connection ────────────────────────────────────────────────────────────
 
-    @property
-    def connected(self) -> bool:
-        return True  # simulation is always "connected"
+    def set_log_callback(self, cb) -> None:
+        """cb(direction: str, message: str) — called for every TX/RX message."""
+        self._log_cb = cb
+
+    def _log(self, direction: str, text: str) -> None:
+        if self._log_cb:
+            try:
+                self._log_cb(direction, text)
+            except Exception:
+                pass
 
     @property
-    def is_simulated(self) -> bool:
-        return self._real is None
+    def connected(self) -> bool:
+        return self._real is not None
 
     def connect_with_config(self, cfg) -> tuple[bool, str]:
         """Connect using a SerialConfig. Returns (ok, info_string)."""
         self.disconnect()
         self._cfg = cfg
-        if not cfg.simulate and cfg.port:
-            try:
-                transport = _SerialDSP7000(cfg)
-                transport.open()
-                self._real = transport
-                return True, f"Connected to DSP7000 on {cfg.port} @ {cfg.baudrate}"
-            except Exception as e:
-                self._real = None
-                if cfg.simulate:
-                    return True, "DSP7000 simulation mode"
-                return False, str(e)
-        # simulation
-        self._real = None
-        return True, "DSP7000 simulation mode"
+        if not cfg.port:
+            return False, "No port specified"
+        try:
+            transport = _SerialDSP7000(cfg, log=self._log)
+            transport.open()
+            idn = transport.query("*IDN?")
+            if not idn:
+                transport.close()
+                return False, "No response to *IDN? — wrong port or device not ready"
+            self._real = transport
+            return True, f"{cfg.port} @ {cfg.baudrate} bps  |  {idn}"
+        except Exception as e:
+            self._real = None
+            return False, str(e)
 
     def disconnect(self) -> None:
         self.stop_polling()
@@ -362,15 +208,13 @@ class MagtrolDSP7000:
                 pass
             self._real = None
 
-    def get_config(self) -> SerialConfig:
+    def get_config(self):
         return self._cfg
 
-    def apply_config(self, cfg: SerialConfig) -> None:
+    def apply_config(self, cfg) -> None:
         self.connect_with_config(cfg)
 
-    # ── config serialisation (for ConfigManager) ──────────────────────────────
-
-    def get_serial_config(self) -> SerialConfig:
+    def get_serial_config(self):
         return self._cfg
 
     # ── polling ───────────────────────────────────────────────────────────────
@@ -412,7 +256,7 @@ class MagtrolDSP7000:
     def identify(self) -> str:
         if self._real:
             return self._real.query("*IDN?")
-        return self._sim.identify()
+        return ""
 
     def read_channel(self, ch: int = 1) -> ChannelData:
         """Query OD1 or OD2 and return ChannelData."""
@@ -423,7 +267,7 @@ class MagtrolDSP7000:
             power = (2.0 * math.pi * speed / 60.0) * torque
             return ChannelData(speed=speed, torque=torque,
                                power=power, direction=direction)
-        return self._sim.read_channel(ch)
+        return ChannelData()
 
     def read_status(self) -> int:
         if self._real:
@@ -432,22 +276,18 @@ class MagtrolDSP7000:
                 return int(resp.strip(), 16)
             except Exception:
                 return 0
-        return self._sim.read_status()
+        return 0
 
     # ── speed control ─────────────────────────────────────────────────────────
 
     def set_speed(self, ch: int, rpm: float) -> None:
         if self._real:
             self._real.send(f"N{ch},{rpm:.2f}")
-        else:
-            self._sim.set_speed(ch, rpm)
 
     def reset_speed(self, ch: int) -> None:
         """Release speed control (free run, brake off)."""
         if self._real:
             self._real.send(f"N{ch}")
-        else:
-            self._sim.reset_speed(ch)
 
     def set_speed_pid(self, ch: int, p: int = 50, i: int = 10, d: int = 0) -> None:
         if self._real:
@@ -460,14 +300,10 @@ class MagtrolDSP7000:
     def set_torque(self, ch: int, torque: float) -> None:
         if self._real:
             self._real.send(f"Q{ch},{torque:.2f}")
-        else:
-            self._sim.set_torque(ch, torque)
 
     def reset_torque(self, ch: int) -> None:
         if self._real:
             self._real.send(f"Q{ch}")
-        else:
-            self._sim.reset_torque(ch)
 
     def set_torque_pid(self, ch: int, p: int = 50, i: int = 10, d: int = 0) -> None:
         if self._real:
@@ -482,14 +318,10 @@ class MagtrolDSP7000:
         pct = max(0.0, min(99.99, pct))
         if self._real:
             self._real.send(f"I{ch},{pct:.2f}")
-        else:
-            self._sim.set_current(ch, pct)
 
     def reset_current(self, ch: int) -> None:
         if self._real:
             self._real.send(f"I{ch}")
-        else:
-            self._sim.set_current(ch, 0.0)
 
     # ── ramp ──────────────────────────────────────────────────────────────────
 
@@ -498,23 +330,17 @@ class MagtrolDSP7000:
         mode = 0 if linear else 1
         if self._real:
             self._real.send(f"PU{ch},{mode},{rate_or_time:.2f}")
-        else:
-            self._sim.ramp_up(ch, linear, rate_or_time)
 
     def ramp_down(self, ch: int, linear: bool = True, rate_or_time: float = 100.0) -> None:
         """PD command: ramp down to 0."""
         mode = 0 if linear else 1
         if self._real:
             self._real.send(f"PD{ch},{mode},{rate_or_time:.2f}")
-        else:
-            self._sim.ramp_down(ch, linear, rate_or_time)
 
     def abort_ramp(self, ch: int) -> None:
         """PR command: halt ramp, return to free run."""
         if self._real:
             self._real.send(f"PR{ch}")
-        else:
-            self._sim.abort_ramp(ch)
 
     # ── channel reset ─────────────────────────────────────────────────────────
 
@@ -522,51 +348,35 @@ class MagtrolDSP7000:
         """R1/R2: manual control on, brake off."""
         if self._real:
             self._real.send(f"R{ch}")
-        else:
-            self._sim.reset_channel(ch)
 
     # ── alarms ────────────────────────────────────────────────────────────────
 
     def set_speed_alarm(self, ch: int, rpm: float) -> None:
         if self._real:
             self._real.send(f"ALS{ch},{rpm:.2f}")
-        else:
-            self._sim.set_speed_alarm(ch, rpm)
 
     def set_torque_alarm(self, ch: int, val: float) -> None:
         if self._real:
             self._real.send(f"ALT{ch},{val:.2f}")
-        else:
-            self._sim.set_torque_alarm(ch, val)
 
     def set_power_alarm(self, ch: int, kw: float) -> None:
         if self._real:
             self._real.send(f"ALP{ch},{kw:.2f}")
-        else:
-            self._sim.set_power_alarm(ch, kw)
 
     def set_alarms(self, ch: int, enable: bool) -> None:
         if self._real:
             self._real.send(f"ALL{ch},{1 if enable else 0}")
-        else:
-            self._sim.set_alarms(ch, enable)
 
     # ── PID / misc ────────────────────────────────────────────────────────────
 
     def freeze_pid(self, ch: int, freeze: bool) -> None:
         if self._real:
             self._real.send(f"FRZ{ch},{1 if freeze else 0}")
-        else:
-            self._sim.freeze_pid(ch, freeze)
 
     def tare(self, ch: int, enable: bool) -> None:
         if self._real:
             self._real.send(f"TS{ch}" if enable else f"TR{ch}")
-        else:
-            self._sim.tare(ch, enable)
 
     def save(self, ch: int) -> None:
         if self._real:
             self._real.send(f"SAVE,{ch}")
-        else:
-            self._sim.save(ch)

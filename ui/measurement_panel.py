@@ -42,8 +42,8 @@ class BigValueDisplay(QFrame):
         self._lbl_mode.setStyleSheet(f"color: {_ACCENT}; font-size: 14pt; font-weight: bold;")
         self._lbl_freq = QLabel("1 kHz")
         self._lbl_freq.setStyleSheet(f"color: {_TEXT_DIM}; font-size: 10pt;")
-        self._lbl_status = QLabel("●  DEMO")
-        self._lbl_status.setStyleSheet(f"color: #FF9800; font-size: 9pt; font-weight: bold;")
+        self._lbl_status = QLabel("○  Disconnected")
+        self._lbl_status.setStyleSheet(f"color: #f44336; font-size: 9pt; font-weight: bold;")
         top_row.addWidget(self._lbl_mode)
         top_row.addWidget(self._lbl_freq)
         top_row.addStretch()
@@ -64,23 +64,26 @@ class BigValueDisplay(QFrame):
         self._lbl_secondary.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._lbl_secondary)
 
-        # phase
+        # phase — only shown for Z / Theta modes
         self._lbl_phase = QLabel("Phase: ---")
         self._lbl_phase.setStyleSheet(f"color: {_TEXT_DIM}; font-size: 9pt;")
         self._lbl_phase.setAlignment(Qt.AlignCenter)
+        self._lbl_phase.setVisible(False)
         layout.addWidget(self._lbl_phase)
 
-    def update_measurement(self, m: Measurement, simulated: bool) -> None:
+    def update_measurement(self, m: Measurement) -> None:
         self._lbl_mode.setText(m.mode_label)
         self._lbl_freq.setText(m.frequency.label)
-        status_txt = "●  OL" if m.overload else ("●  HOLD" if m.hold else
-                      ("●  DEMO" if simulated else "●  LIVE"))
-        status_col = "#f44336" if m.overload else ("#FF9800" if simulated else "#4CAF50")
+        status_txt = "●  OL" if m.overload else ("●  HOLD" if m.hold else "●  LIVE")
+        status_col = "#f44336" if m.overload else "#4CAF50"
         self._lbl_status.setText(status_txt)
         self._lbl_status.setStyleSheet(f"color: {status_col}; font-size: 9pt; font-weight: bold;")
         self._lbl_primary.setText(m.primary_str)
         self._lbl_secondary.setText(m.secondary_str)
-        self._lbl_phase.setText(f"Phase: {m.phase:.2f}°")
+        show_phase = m.mode in (MeasureMode.Z, MeasureMode.Theta)
+        self._lbl_phase.setVisible(show_phase)
+        if show_phase:
+            self._lbl_phase.setText(f"Phase: {m.phase:.2f}°")
 
 
 class ControlPanel(QGroupBox):
@@ -117,10 +120,11 @@ class ControlPanel(QGroupBox):
             QComboBox QAbstractItemView {{ background: #333350; color: {_TEXT_MAIN}; }}
         """
 
-        # Mode
+        # Mode — default to Cs (index 2) to match driver default
         grid.addWidget(self._lbl("Mode", lbl_style), 0, 0)
         self._combo_mode = QComboBox()
         self._combo_mode.addItems([m.name for m in MeasureMode])
+        self._combo_mode.setCurrentIndex(list(MeasureMode).index(MeasureMode.Cs))
         self._combo_mode.setStyleSheet(combo_style)
         self._combo_mode.currentIndexChanged.connect(self._on_mode)
         grid.addWidget(self._combo_mode, 0, 1)
@@ -215,4 +219,4 @@ class MeasurementPanel(QWidget):
 
     def _refresh(self) -> None:
         m = self._device.measure()
-        self._display.update_measurement(m, self._device.is_simulated)
+        self._display.update_measurement(m)
