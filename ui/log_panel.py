@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from instruments import (
-    HantekRLC1733C, OwonSP3103, LMG450, MagtrolDSP7000,
+    HantekRLC1733C, OwonSP3103, LMG450, MagtrolDSP7000, Array3721A,
 )
 
 _DARK_BG = "#1A1A2A"
@@ -95,6 +95,9 @@ def _dsp(ch, attr):
     key = f"dsp_ch{ch}"
     return lambda s: getattr(s[key], attr) if s.get(key) else ""
 
+def _eload(attr):
+    return lambda s: getattr(s["eload"], attr) if s.get("eload") else ""
+
 
 FIELDS: list[FieldDef] = [
     # ── LCR Meter ──────────────────────────────────────────────────────────────
@@ -152,6 +155,14 @@ FIELDS: list[FieldDef] = [
             FieldDef(f"DSP7000 — Ch {ch}", f"dsp{ch}_direction", "Direction", "",    False, _dsp(ch, "direction")),
         ]
     ],
+
+    # ── Array 3721A Electronic Load ───────────────────────────────────────────
+    FieldDef("E-Load (Array 3721A)", "eload_vmeas",    "Voltage",    "V",  True,  _eload("meas_voltage")),
+    FieldDef("E-Load (Array 3721A)", "eload_imeas",    "Current",    "A",  True,  _eload("meas_current")),
+    FieldDef("E-Load (Array 3721A)", "eload_power",    "Power",      "W",  True,  lambda s: s["eload"].power if s.get("eload") else ""),
+    FieldDef("E-Load (Array 3721A)", "eload_mode",     "Mode",       "",   False, _eload("mode")),
+    FieldDef("E-Load (Array 3721A)", "eload_setval",   "Set Level",  "",   False, _eload("set_value")),
+    FieldDef("E-Load (Array 3721A)", "eload_input",    "Input on",   "",   False, lambda s: int(s["eload"].input_on) if s.get("eload") else ""),
 ]
 
 # pre-build lookup by key
@@ -173,12 +184,14 @@ class LogPanel(QWidget):
                  psu: OwonSP3103 | None = None,
                  lmg: LMG450 | None = None,
                  dsp: MagtrolDSP7000 | None = None,
+                 eload: Array3721A | None = None,
                  parent=None) -> None:
         super().__init__(parent)
-        self._lcr = lcr
-        self._psu = psu
-        self._lmg = lmg
-        self._dsp = dsp
+        self._lcr   = lcr
+        self._psu   = psu
+        self._lmg   = lmg
+        self._dsp   = dsp
+        self._eload = eload
 
         self._log_file: Path | None = None
         self._writer:   csv.DictWriter | None = None
@@ -430,6 +443,9 @@ class LogPanel(QWidget):
                         self._dsp._state.channels[ch - 1]
                         if self._dsp.connected else None
                     )
+
+        if self._eload and any(k.startswith("eload") for k in keys):
+            snap["eload"] = self._eload._state if self._eload.connected else None
 
         return snap
 

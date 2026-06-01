@@ -285,7 +285,8 @@ class MainWindow(QMainWindow):
         self._eload_panel = ELoadPanel(self._eload)
         left.addTab(self._eload_panel, "🔋  E-Load")
 
-        self._log_panel = LogPanel(self._device, self._psu, self._lmg, self._dsp)
+        self._log_panel = LogPanel(self._device, self._psu, self._lmg, self._dsp,
+                                   eload=self._eload)
         left.addTab(self._log_panel, "📋  Data Log")
 
         splitter.addWidget(left)
