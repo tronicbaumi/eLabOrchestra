@@ -32,12 +32,13 @@ except ImportError:
 
 
 class ExecContext:
-    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None) -> None:
+    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None, eload=None) -> None:
         self.device     = device
         self.psu        = psu
         self.lmg        = lmg
         self.dsp        = dsp
         self.dashboard  = dashboard
+        self.eload      = eload
         self._dsp_ch    = 1   # active channel for dsp commands
         self.variables: dict[str, Any] = {}
         self.running = True
@@ -57,12 +58,13 @@ class ExecContext:
 class BlocklyExecutor:
     """Runs a program dict (from BlocklyBridge.program) in background threads."""
 
-    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None) -> None:
+    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None, eload=None) -> None:
         self._device     = device
         self._psu        = psu
         self._lmg        = lmg
         self._dsp        = dsp
         self._dashboard  = dashboard
+        self._eload      = eload
         self._threads: list[threading.Thread] = []
         self._ctx: Optional[ExecContext] = None
         self._show_cbs: list[Callable[[str, Any], None]] = []
@@ -78,7 +80,8 @@ class BlocklyExecutor:
     def run(self, program: dict) -> None:
         self.stop()
         ctx = ExecContext(device=self._device, psu=self._psu, lmg=self._lmg,
-                          dsp=self._dsp, dashboard=self._dashboard)
+                          dsp=self._dsp, dashboard=self._dashboard,
+                          eload=self._eload)
         for cb in self._show_cbs: ctx.add_show_cb(cb)
         for cb in self._log_cbs:  ctx.add_log_cb(cb)
         self._ctx = ctx
