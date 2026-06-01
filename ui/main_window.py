@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QInputDialog, QSplitter,
 )
 
-from instruments import HantekRLC1733C, OwonSP3103, LMG450, MagtrolDSP7000
+from instruments import HantekRLC1733C, OwonSP3103, LMG450, MagtrolDSP7000, Array3721A
 from scratch import BlocklyCanvas, BlocklyExecutor, BlockProgram
 from config import ConfigManager
 from .measurement_panel import MeasurementPanel
@@ -26,6 +26,7 @@ from .dashboard_panel import DashboardPanel
 from .dsp7000_panel import DSP7000Panel
 from .uart_terminal_panel import UartTerminalPanel
 from .ai_panel import AIPanel
+from .eload_panel import ELoadPanel
 
 _DARK   = "#1A1A2A"
 _CARD   = "#252535"
@@ -169,18 +170,20 @@ class MainWindow(QMainWindow):
         self._psu    = OwonSP3103()
         self._lmg    = LMG450()
         self._dsp    = MagtrolDSP7000()
+        self._eload  = Array3721A()
 
         # ── connection helpers (hold serial config, no UI) ────────────────────
-        self._lcr_conn = _InstrumentConn(self._device, parent=self)
-        self._psu_conn = _InstrumentConn(self._psu,    parent=self)
-        self._lmg_conn = _InstrumentConn(self._lmg,    parent=self)
-        self._dsp_conn = _InstrumentConn(self._dsp,    parent=self)
+        self._lcr_conn   = _InstrumentConn(self._device, parent=self)
+        self._psu_conn   = _InstrumentConn(self._psu,    parent=self)
+        self._lmg_conn   = _InstrumentConn(self._lmg,    parent=self)
+        self._dsp_conn   = _InstrumentConn(self._dsp,    parent=self)
+        self._eload_conn = _InstrumentConn(self._eload,  parent=self)
 
         self._config    = ConfigManager()
         self._dashboard = DashboardPanel()
         self._executor  = BlocklyExecutor(
             device=self._device, psu=self._psu, lmg=self._lmg,
-            dsp=self._dsp, dashboard=self._dashboard)
+            dsp=self._dsp, dashboard=self._dashboard, eload=self._eload)
 
         self._build_ui()
         self._build_menu()
@@ -220,11 +223,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            d = cfg.get("eload_serial") or {}
+            self._eload_conn.set_serial_config(
+                SerialConfig.from_dict(d) if d else
+                SerialConfig(baudrate=9600))
+        except Exception:
+            pass
+
         # auto-connect all instruments
         self._lcr_conn.do_connect()
         self._psu_conn.do_connect()
         self._lmg_conn.do_connect()
         self._dsp_conn.do_connect()
+        self._eload_conn.do_connect()
 
         # restore program XML
         prog_cfg = cfg.get("program", {})
@@ -247,6 +259,7 @@ class MainWindow(QMainWindow):
             ("OWON SP3103",            self._psu_conn),
             ("ZES Zimmer LMG450",      self._lmg_conn),
             ("Magtrol DSP7000",        self._dsp_conn),
+            ("Array 3721A",            self._eload_conn),
         ])
         root.addWidget(self._status_strip)
 
@@ -269,6 +282,9 @@ class MainWindow(QMainWindow):
         self._dsp_panel = DSP7000Panel(self._dsp)
         left.addTab(self._dsp_panel, "⚙  DSP7000")
 
+        self._eload_panel = ELoadPanel(self._eload)
+        left.addTab(self._eload_panel, "🔋  E-Load")
+
         self._log_panel = LogPanel(self._device, self._psu, self._lmg, self._dsp)
         left.addTab(self._log_panel, "📋  Data Log")
 
@@ -286,6 +302,7 @@ class MainWindow(QMainWindow):
             "OWON SP3103":       self._psu,
             "ZES Zimmer LMG450": self._lmg,
             "Magtrol DSP7000":   self._dsp,
+            "Array 3721A":       self._eload,
         })
         right_tabs.addTab(self._uart_terminal, "🖥  UART Terminal")
 
@@ -385,6 +402,17 @@ class MainWindow(QMainWindow):
         dsp_menu.addAction("Save Config",
                            lambda: (self._dsp.save(1), self._dsp.save(2)))
 
+        # ── E-Load ────────────────────────────────────────────────────────────
+        eload_menu = mb.addMenu("&E-Load")
+        eload_menu.addAction("Serial Port Configuration…",
+                             self._open_eload_uart_config)
+        eload_menu.addSeparator()
+        eload_menu.addAction("Connect",    self._eload_connect)
+        eload_menu.addAction("Disconnect", self._eload_disconnect)
+        eload_menu.addSeparator()
+        eload_menu.addAction("Enable Input",  lambda: self._eload_input(True))
+        eload_menu.addAction("Disable Input", lambda: self._eload_input(False))
+
         # ── Blockly ───────────────────────────────────────────────────────────
         blockly_menu = mb.addMenu("&Blockly")
         blockly_menu.addAction("Clear Workspace",  self._new_program,      "Ctrl+Shift+N")
@@ -454,7 +482,7 @@ class MainWindow(QMainWindow):
     def _set_instrument_polling(self, active: bool) -> None:
         """Pause or resume all instrument panel timers (but not the log timer)."""
         for panel in (self._meas_panel, self._psu_panel,
-                      self._lmg_panel, self._dsp_panel):
+                      self._lmg_panel, self._dsp_panel, self._eload_panel):
             if active:
                 panel._timer.start(500)
             else:
@@ -636,6 +664,31 @@ class MainWindow(QMainWindow):
         self._dsp_conn.do_disconnect()
         self._status.showMessage("DSP7000 disconnected.")
 
+    # ── E-Load actions ────────────────────────────────────────────────────────
+
+    def _open_eload_uart_config(self) -> None:
+        cfg = self._eload_conn.serial_cfg or SerialConfig(baudrate=9600)
+        dlg = UartConfigDialog(cfg, parent=self)
+        if dlg.exec():
+            self._eload_conn.set_serial_config(dlg.config)
+            self._eload_conn.do_connect_with_warning(self)
+            self._status.showMessage(
+                f"E-Load serial port: {dlg.config.port}  {dlg.config.baudrate}")
+
+    def _eload_connect(self) -> None:
+        self._eload_conn.do_connect_with_warning(self)
+
+    def _eload_disconnect(self) -> None:
+        self._eload_conn.do_disconnect()
+        self._status.showMessage("Array 3721A disconnected.")
+
+    def _eload_input(self, on: bool) -> None:
+        if self._eload.connected:
+            self._eload.set_input(on)
+            self._eload_panel._input_on = on
+            self._eload_panel._refresh_input_ui()
+            self._status.showMessage(f"E-Load input {'ON' if on else 'OFF'}")
+
     # ── Profile save/load ─────────────────────────────────────────────────────
 
     def _save_profile(self) -> None:
@@ -650,6 +703,8 @@ class MainWindow(QMainWindow):
             self._config.set("lmg_serial", self._lmg_conn.serial_cfg.to_dict())
             if self._dsp_conn.serial_cfg:
                 self._config.set("dsp_serial", self._dsp_conn.serial_cfg.to_dict())
+            self._config.set("eload_device", self._eload.get_config())
+            self._config.set("eload_serial", self._eload_conn.serial_cfg.to_dict())
             self._config.save(name)
             self._status.showMessage(f"Profile '{name}' saved.")
 
@@ -694,6 +749,14 @@ class MainWindow(QMainWindow):
                         SerialConfig.from_dict(cfg["dsp_serial"]))
                 except Exception:
                     pass
+            if cfg.get("eload_device"):
+                self._eload.apply_config(cfg["eload_device"])
+            if cfg.get("eload_serial"):
+                try:
+                    self._eload_conn.set_serial_config(
+                        SerialConfig.from_dict(cfg["eload_serial"]))
+                except Exception:
+                    pass
             self._status.showMessage(f"Profile '{name}' loaded.")
 
     # ── Help ──────────────────────────────────────────────────────────────────
@@ -702,7 +765,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "About eLabOrchestra",
             "<b>eLabOrchestra</b><br>"
             "Electronic instrument control &amp; automation.<br><br>"
-            "Instruments: Hantek RLC 1733C · OWON SP3103 · ZES Zimmer LMG450 · Magtrol DSP7000<br>"
+            "Instruments: Hantek RLC 1733C · OWON SP3103 · ZES Zimmer LMG450 · Magtrol DSP7000 · Array 3721A<br>"
             "Visual programming: Google Blockly v10.4.3<br>"
             "<small>v0.3  —  eLabOrchestra project</small>")
 
@@ -716,10 +779,13 @@ class MainWindow(QMainWindow):
         self._config.set("serial",     self._lcr_conn.serial_cfg.to_dict())
         self._config.set("psu_device", self._psu.get_config())
         self._config.set("psu_serial", self._psu_conn.serial_cfg.to_dict())
-        self._config.set("lmg_device", self._lmg.get_config())
-        self._config.set("lmg_serial", self._lmg_conn.serial_cfg.to_dict())
+        self._config.set("lmg_device",   self._lmg.get_config())
+        self._config.set("lmg_serial",   self._lmg_conn.serial_cfg.to_dict())
+        self._config.set("eload_device", self._eload.get_config())
+        self._config.set("eload_serial", self._eload_conn.serial_cfg.to_dict())
         self._config.save("last_session")
         self._device.disconnect()
         self._psu.disconnect()
         self._lmg.disconnect()
+        self._eload.disconnect()
         event.accept()
