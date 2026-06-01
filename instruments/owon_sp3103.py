@@ -4,19 +4,20 @@ OWON SP3103 DC Power Supply driver.
 Communication: USB-CDC serial (SCPI-like protocol).
 Default: 9600 baud, 8N1.
 
-Command set used by this driver:
+Command set used by this driver (standard SCPI per SP3103 manual):
   *IDN?           → identify string
-  VSET1:<v>       → set voltage channel 1 (0.00 – 30.00 V)
-  ISET1:<i>       → set current limit channel 1 (0.000 – 3.000 A)
-  VSET1?          → read set voltage
-  ISET1?          → read set current limit
-  OUT1            → enable output
-  OUT0            → disable output
+  SYST:REM        → enter remote control mode
+  VOLT <v>        → set voltage (0.00 – 30.00 V)
+  CURR <i>        → set current limit (0.000 – 3.000 A)
+  VOLT?           → read set voltage
+  CURR?           → read set current limit
+  OUTP ON|OFF     → enable/disable output
   OUTP?           → read output state ("1" or "0")
-  VOUT1?          → read actual output voltage
-  IOUT1?          → read actual output current
+  MEAS:VOLT?      → read actual output voltage
+  MEAS:CURR?      → read actual output current
+  MEAS:POW?       → read actual output power
 
-Power is computed locally from V × I.
+Power is also available directly from MEAS:POW?.
 """
 
 from __future__ import annotations
@@ -144,6 +145,7 @@ class OwonSP3103:
                 self._dev.close()
                 self._dev = None
                 return False, "No response to *IDN? — wrong port or device not ready"
+            self._dev.write("SYST:REM")
             self._port_info = f"{port}  {baudrate} bps  |  {idn}"
             self._connected = True
             return True, self._port_info
@@ -171,20 +173,20 @@ class OwonSP3103:
         volts = max(0.0, min(self.MAX_VOLTAGE, float(volts)))
         with self._lock:
             if self._dev:
-                self._dev.write(f"VSET1:{volts:.2f}")
+                self._dev.write(f"VOLT {volts:.2f}")
         self._state.set_voltage = volts
 
     def set_current(self, amps: float) -> None:
         amps = max(0.0, min(self.MAX_CURRENT, float(amps)))
         with self._lock:
             if self._dev:
-                self._dev.write(f"ISET1:{amps:.3f}")
+                self._dev.write(f"CURR {amps:.3f}")
         self._state.set_current = amps
 
     def set_output(self, on: bool) -> None:
         with self._lock:
             if self._dev:
-                self._dev.write("OUT1" if on else "OUT0")
+                self._dev.write("OUTP ON" if on else "OUTP OFF")
         self._state.output_on = on
 
     def measure(self) -> PSUState:
@@ -192,8 +194,8 @@ class OwonSP3103:
             if not self._dev:
                 return PSUState()
             try:
-                vout = float(self._dev.query("VOUT1?") or 0)
-                iout = float(self._dev.query("IOUT1?") or 0)
+                vout = float(self._dev.query("MEAS:VOLT?") or 0)
+                iout = float(self._dev.query("MEAS:CURR?") or 0)
                 outp = self._dev.query("OUTP?").strip() == "1"
                 self._state.meas_voltage = round(vout, 4)
                 self._state.meas_current = round(iout, 4)

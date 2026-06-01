@@ -45,7 +45,7 @@ class _BigValue(QFrame):
         row = QHBoxLayout()
         self._lbl_val = QLabel("—")
         self._lbl_val.setStyleSheet(
-            f"color:{color}; font-size:28pt; font-weight:bold; letter-spacing:2px;")
+            f"color:{color}; font-size:17pt; font-weight:bold; letter-spacing:2px;")
         row.addWidget(self._lbl_val)
 
         lbl_unit = QLabel(unit)
@@ -121,7 +121,25 @@ class PowerSupplyPanel(QWidget):
             s.setStyleSheet(
                 f"QDoubleSpinBox {{ background:#333350; color:{_TEXT}; "
                 f"border:1px solid #555580; border-radius:4px; "
-                f"padding:4px 8px; font-size:10pt; min-height:28px; }}"
+                f"padding:4px 24px 4px 8px; font-size:10pt; min-height:28px; }}"
+                f"QDoubleSpinBox::up-button {{ subcontrol-origin:border; "
+                f"subcontrol-position:top right; width:22px; border-left:1px solid #555580; "
+                f"border-bottom:1px solid #555580; border-top-right-radius:4px; "
+                f"background:#444466; }}"
+                f"QDoubleSpinBox::up-button:hover {{ background:#555588; }}"
+                f"QDoubleSpinBox::up-button:pressed {{ background:#4C97FF; }}"
+                f"QDoubleSpinBox::up-arrow {{ width:8px; height:8px; "
+                f"border-left:4px solid transparent; border-right:4px solid transparent; "
+                f"border-bottom:6px solid {_TEXT}; }}"
+                f"QDoubleSpinBox::down-button {{ subcontrol-origin:border; "
+                f"subcontrol-position:bottom right; width:22px; border-left:1px solid #555580; "
+                f"border-top:1px solid #555580; border-bottom-right-radius:4px; "
+                f"background:#444466; }}"
+                f"QDoubleSpinBox::down-button:hover {{ background:#555588; }}"
+                f"QDoubleSpinBox::down-button:pressed {{ background:#4C97FF; }}"
+                f"QDoubleSpinBox::down-arrow {{ width:8px; height:8px; "
+                f"border-left:4px solid transparent; border-right:4px solid transparent; "
+                f"border-top:6px solid {_TEXT}; }}"
             )
             return s
 

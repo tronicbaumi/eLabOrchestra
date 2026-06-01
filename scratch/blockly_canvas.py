@@ -108,6 +108,9 @@ class BlocklyCanvas(QWidget):
 
         self._btn_run.clicked.connect(self.run_requested)
         self._btn_stop.clicked.connect(self.stop_requested)
+
+        # Initial state: nothing is running yet
+        self._btn_stop.setEnabled(False)
         self._btn_clear.clicked.connect(self.clear_workspace)
 
         layout.addWidget(self._btn_run)
@@ -162,6 +165,11 @@ class BlocklyCanvas(QWidget):
     @property
     def program(self) -> dict:
         return self._bridge.program
+
+    def set_running(self, running: bool) -> None:
+        """Grey out Run while executing; grey out Stop while idle."""
+        self._btn_run.setEnabled(not running)
+        self._btn_stop.setEnabled(running)
 
     def set_run_status(self, msg: str) -> None:
         self._bridge.set_status(msg)

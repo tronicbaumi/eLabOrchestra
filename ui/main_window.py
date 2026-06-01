@@ -419,6 +419,7 @@ class MainWindow(QMainWindow):
                 f"QPushButton {{ background:{color}; color:white; border-radius:4px;"
                 f" font-weight:bold; padding:0 12px; margin:2px; }}"
                 f"QPushButton:hover {{ background:{QColor(color).lighter(120).name()}; }}"
+                f"QPushButton:disabled {{ background:#444; color:#777; }}"
             )
             b.clicked.connect(slot)
             tb.addWidget(b)
@@ -426,6 +427,7 @@ class MainWindow(QMainWindow):
 
         self._tb_run  = add_btn("▶  Run",  "#4CAF50", self._run_program)
         self._tb_stop = add_btn("■  Stop", "#f44336", self._stop_program)
+        self._tb_stop.setEnabled(False)   # nothing running on startup
         tb.addSeparator()
         add_btn("💾  Save", "#607D8B", self._save_program)
         add_btn("📂  Open", "#607D8B", self._open_program)
@@ -458,16 +460,23 @@ class MainWindow(QMainWindow):
             else:
                 panel._timer.stop()
 
+    def _set_blockly_running(self, running: bool) -> None:
+        self._tb_run.setEnabled(not running)
+        self._tb_stop.setEnabled(running)
+        self._scratch.set_running(running)
+
     def _run_program(self) -> None:
         self._set_instrument_polling(False)
         prog = self._scratch.get_program_dict()
         self._executor.run(prog)
+        self._set_blockly_running(True)
         self._scratch.set_run_status("Running…")
         self._status.showMessage("Program running…")
 
     def _stop_program(self) -> None:
         self._executor.stop()
         self._set_instrument_polling(True)
+        self._set_blockly_running(False)
         self._scratch.set_run_status("Idle")
         self._status.showMessage("Program stopped.")
 

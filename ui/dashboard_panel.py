@@ -328,7 +328,11 @@ class _TextDisplay(QWidget):
         self._label = label; self._colour = colour; self.update()
 
     def set_value(self, value) -> None:
-        self._value = str(value); self.update()
+        if isinstance(value, float):
+            self._value = f"{value:.3f}"
+        else:
+            self._value = str(value)
+        self.update()
 
     def get_config(self) -> dict:
         return {"label": self._label, "colour": self._colour}
