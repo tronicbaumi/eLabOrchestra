@@ -198,6 +198,8 @@ class LogPanel(QWidget):
         self._fh        = None
         self._rows:     list[dict] = []
         self._active_keys: list[str] = []   # ordered list of checked field keys
+        self._flush_counter: int = 0
+        self._TABLE_MAX_ROWS = 2000
 
         self.setStyleSheet(f"background: {_DARK_BG};")
         self._build_ui()
@@ -394,8 +396,10 @@ class LogPanel(QWidget):
     def _stop_log(self) -> None:
         self._timer.stop()
         if self._fh:
+            self._fh.flush()
             self._fh.close()
             self._fh = None
+        self._flush_counter = 0
         self._writer = None
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
@@ -414,37 +418,43 @@ class LogPanel(QWidget):
         LCR: fresh query; PSU/LMG/DSP: read cached _state (already updated
         by the instrument panel QTimers at 500 ms).
         """
-        keys = set(self._active_keys)
+        # Build prefix set once instead of calling any(startswith) per check
+        prefixes: set[str] = set()
+        for k in self._active_keys:
+            prefixes.add(k.split("_")[0])
+
         snap: dict = {}
 
-        if any(k.startswith("lcr") for k in keys):
+        if "lcr" in prefixes:
             snap["lcr"] = self._lcr.measure() if self._lcr.connected else None
 
-        if self._psu and any(k.startswith("psu") for k in keys):
+        if self._psu and "psu" in prefixes:
             snap["psu"] = self._psu._state if self._psu.connected else None
 
         if self._lmg:
+            lmg_connected = self._lmg.connected
             for ch in range(1, 5):
-                if any(k.startswith(f"lmg{ch}_") for k in keys):
+                if f"lmg{ch}" in prefixes:
                     snap[f"lmg_ch{ch}"] = (
                         self._lmg._state.channels[ch - 1]
-                        if self._lmg.connected else None
+                        if lmg_connected else None
                     )
-            if any(k.startswith("lmg_") for k in keys):
+            if "lmg" in prefixes:
                 snap["lmg_agg"] = (
                     self._lmg._state.aggregate
-                    if self._lmg.connected else None
+                    if lmg_connected else None
                 )
 
         if self._dsp:
+            dsp_connected = self._dsp.connected
             for ch in (1, 2):
-                if any(k.startswith(f"dsp{ch}_") for k in keys):
+                if f"dsp{ch}" in prefixes:
                     snap[f"dsp_ch{ch}"] = (
                         self._dsp._state.channels[ch - 1]
-                        if self._dsp.connected else None
+                        if dsp_connected else None
                     )
 
-        if self._eload and any(k.startswith("eload") for k in keys):
+        if self._eload and "eload" in prefixes:
             snap["eload"] = self._eload._state if self._eload.connected else None
 
         return snap
@@ -465,13 +475,20 @@ class LogPanel(QWidget):
 
         if self._writer:
             self._writer.writerow(row)
-            self._fh.flush()
+            self._flush_counter += 1
+            if self._flush_counter >= 10:
+                self._fh.flush()
+                self._flush_counter = 0
 
         self._rows.append(row)
         self._add_table_row(row, ts)
-        self._lbl_count.setText(f"{len(self._rows)} rows")
+        if len(self._rows) % 10 == 0:
+            self._lbl_count.setText(f"{len(self._rows)} rows")
 
     def _add_table_row(self, row: dict, ts: str) -> None:
+        # Evict oldest row when cap is reached to bound memory and repaint cost
+        if self._table.rowCount() >= self._TABLE_MAX_ROWS:
+            self._table.removeRow(0)
         r = self._table.rowCount()
         self._table.insertRow(r)
         vals = [ts] + [row.get(k, "") for k in self._active_keys]

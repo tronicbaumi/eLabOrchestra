@@ -49,6 +49,7 @@ class ExecutionContext:
         self.variables: dict[str, Any] = {}
         self.log_file: Optional[Any] = None
         self.running = True
+        self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._on_show: list[Callable[[str, Any], None]] = []
         self._on_log: list[Callable[[str, Any], None]] = []
@@ -104,6 +105,7 @@ class BlockExecutor:
     def stop(self) -> None:
         if self._ctx:
             self._ctx.running = False
+            self._ctx._stop_event.set()
         for t in self._threads:
             t.join(timeout=1)
         self._threads.clear()
@@ -123,10 +125,7 @@ class BlockExecutor:
             interval = float(hat.get_field("interval") or 1.0)
             while ctx.running:
                 self._run_sequence(hat.next, ctx)
-                t = 0.0
-                while t < interval and ctx.running:
-                    time.sleep(0.05)
-                    t += 0.05
+                ctx._stop_event.wait(timeout=interval)
         elif bid == "on_measure":
             # Run the body each time _last_measurement updates
             self._run_sequence(hat.next, ctx)
@@ -143,9 +142,7 @@ class BlockExecutor:
 
         if bid == "wait":
             secs = float(block.get_field("secs") or 1)
-            deadline = time.time() + secs
-            while time.time() < deadline and ctx.running:
-                time.sleep(0.05)
+            ctx._stop_event.wait(timeout=secs)
 
         elif bid == "stop_all":
             ctx.running = False
