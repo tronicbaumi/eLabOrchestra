@@ -1,11 +1,14 @@
 """
 AI chatbot panel — generate Blockly programs from natural-language descriptions.
 
-Uses the Anthropic Claude API (streaming) to turn plain-English prompts into
-valid Blockly XML that can be loaded directly into the workspace.
+Supports two backends:
+  • Claude (Anthropic API, streaming) — requires an API key.
+  • ChatGPT Free (via the g4f library, gpt-4o-mini) — no API key required.
+    Install with:  pip install g4f
 
-API key is read from the ANTHROPIC_API_KEY environment variable.
-If it is absent the user can paste it into the key field at the top of the panel.
+The active backend is chosen from the drop-down in the key bar.
+Claude's API key is read from the ANTHROPIC_API_KEY environment variable;
+it can also be pasted into the key field.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from PySide6.QtCore import Qt, Signal, QObject, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser,
     QTextEdit, QPushButton, QLabel, QFrame, QSplitter,
-    QLineEdit, QSizePolicy, QScrollArea,
+    QLineEdit, QSizePolicy, QScrollArea, QComboBox,
 )
 from PySide6.QtGui import QTextCursor, QFont, QKeyEvent, QColor
 
@@ -256,6 +259,54 @@ class _StreamWorker(QObject):
             self.error.emit(str(exc))
 
 
+# ── ChatGPT (free) streaming worker ──────────────────────────────────────────
+
+class _ChatGPTWorker(QObject):
+    """
+    Runs gpt-4o-mini via the g4f library (no API key required) in a
+    background thread and emits signals back to the main thread.
+
+    Install dependency:  pip install g4f
+    """
+
+    chunk = Signal(str)
+    done  = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, messages: list[dict], parent=None):
+        super().__init__(parent)
+        self._messages = messages
+
+    def run(self) -> None:
+        try:
+            from g4f.client import Client  # optional dependency
+        except ImportError:
+            self.error.emit(
+                "The 'g4f' package is not installed.\n"
+                "Run:  pip install g4f"
+            )
+            return
+
+        try:
+            client = Client()
+            # Prepend the system prompt as a system message
+            msgs = [{"role": "system", "content": _SYSTEM}] + self._messages
+            stream = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=msgs,
+                stream=True,
+            )
+            full = ""
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    full += delta
+                    self.chunk.emit(delta)
+            self.done.emit(full)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 # ── main panel ─────────────────────────────────────────────────────────────────
 
 class AIPanel(QWidget):
@@ -270,12 +321,17 @@ class AIPanel(QWidget):
     # Emitted when the user clicks "Apply to Blockly" — carries the XML string.
     xml_ready = Signal(str)
 
+    #: internal constants for backend selection
+    _BACKEND_CLAUDE = "Claude (Anthropic)"
+    _BACKEND_GPT    = "ChatGPT Free (gpt-4o-mini)"
+
     def __init__(self, blockly_canvas=None, parent=None):
         super().__init__(parent)
         self._canvas     = blockly_canvas
-        self._history: list[dict] = []    # Anthropic messages list
+        self._history: list[dict] = []    # conversation history (shared across backends)
         self._pending_xml: str = ""       # XML extracted from last response
         self._worker_thread: threading.Thread | None = None
+        self._backend: str = self._BACKEND_CLAUDE   # active backend
 
         self._build_ui()
         self._apply_styles()
@@ -287,7 +343,7 @@ class AIPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── API key bar ───────────────────────────────────────────────────────
+        # ── top bar: backend selector + API key ──────────────────────────────
         key_bar = QFrame()
         key_bar.setObjectName("keyBar")
         key_bar.setFixedHeight(38)
@@ -295,9 +351,27 @@ class AIPanel(QWidget):
         key_layout.setContentsMargins(10, 4, 10, 4)
         key_layout.setSpacing(6)
 
-        key_lbl = QLabel("API Key:")
-        key_lbl.setObjectName("dimLabel")
-        key_layout.addWidget(key_lbl)
+        # Backend selector
+        backend_lbl = QLabel("Backend:")
+        backend_lbl.setObjectName("dimLabel")
+        key_layout.addWidget(backend_lbl)
+
+        self._backend_combo = QComboBox()
+        self._backend_combo.setObjectName("backendCombo")
+        self._backend_combo.addItems([self._BACKEND_CLAUDE, self._BACKEND_GPT])
+        self._backend_combo.setFixedWidth(200)
+        self._backend_combo.currentTextChanged.connect(self._on_backend_changed)
+        key_layout.addWidget(self._backend_combo)
+
+        # Divider
+        div = QLabel("|")
+        div.setObjectName("dimLabel")
+        key_layout.addWidget(div)
+
+        # Claude API key (hidden when ChatGPT is selected)
+        self._key_lbl = QLabel("API Key:")
+        self._key_lbl.setObjectName("dimLabel")
+        key_layout.addWidget(self._key_lbl)
 
         self._key_edit = QLineEdit()
         self._key_edit.setPlaceholderText(
@@ -316,6 +390,12 @@ class AIPanel(QWidget):
         self._key_toggle.setFixedWidth(48)
         self._key_toggle.clicked.connect(self._toggle_key_visibility)
         key_layout.addWidget(self._key_toggle)
+
+        # "No key needed" label shown when ChatGPT is selected
+        self._no_key_lbl = QLabel("✔ No API key required")
+        self._no_key_lbl.setObjectName("noKeyLabel")
+        self._no_key_lbl.setVisible(False)
+        key_layout.addWidget(self._no_key_lbl, 1)
 
         root.addWidget(key_bar)
 
@@ -430,6 +510,23 @@ class AIPanel(QWidget):
                 padding: 2px 4px;
             }}
             #smallBtn:hover {{ background: #444477; color: {_TEXT}; }}
+            #backendCombo {{
+                background: {_CARD};
+                color: {_TEXT};
+                border: 1px solid #333355;
+                border-radius: 4px;
+                padding: 2px 4px;
+                font-size: 8pt;
+            }}
+            #backendCombo QAbstractItemView {{
+                background: {_CARD};
+                color: {_TEXT};
+                selection-background-color: {_ACCENT};
+            }}
+            #noKeyLabel {{
+                color: #81C784;
+                font-size: 8pt;
+            }}
             #dimLabel {{
                 color: {_DIM};
                 font-size: 8pt;
@@ -536,18 +633,31 @@ class AIPanel(QWidget):
             self._key_edit.setEchoMode(QLineEdit.Password)
             self._key_toggle.setText("Show")
 
+    def _on_backend_changed(self, text: str) -> None:
+        """Show/hide the API key widgets depending on the selected backend."""
+        self._backend = text
+        is_claude = (text == self._BACKEND_CLAUDE)
+        self._key_lbl.setVisible(is_claude)
+        self._key_edit.setVisible(is_claude)
+        self._key_toggle.setVisible(is_claude)
+        self._no_key_lbl.setVisible(not is_claude)
+
     def _send(self) -> None:
         prompt = self._input.toPlainText().strip()
         if not prompt:
             return
 
-        api_key = self._key_edit.text().strip()
-        if not api_key:
-            self._append_error(
-                "Please enter your Anthropic API key above, "
-                "or set the ANTHROPIC_API_KEY environment variable."
-            )
-            return
+        # Validate Claude key only when Claude is selected
+        if self._backend == self._BACKEND_CLAUDE:
+            api_key = self._key_edit.text().strip()
+            if not api_key:
+                self._append_error(
+                    "Please enter your Anthropic API key above, "
+                    "or set the ANTHROPIC_API_KEY environment variable."
+                )
+                return
+        else:
+            api_key = ""
 
         self._input.clear()
         self._apply_bar.setVisible(False)
@@ -564,8 +674,12 @@ class AIPanel(QWidget):
         self._chat.append("")
         self._start_assistant_bubble()
 
-        # Launch streaming in background thread
-        worker = _StreamWorker(api_key, list(self._history))
+        # Launch streaming in a background thread using the selected backend
+        if self._backend == self._BACKEND_CLAUDE:
+            worker = _StreamWorker(api_key, list(self._history))
+        else:
+            worker = _ChatGPTWorker(list(self._history))
+
         worker.chunk.connect(self._on_chunk)
         worker.done.connect(self._on_done)
         worker.error.connect(self._on_error)
@@ -600,14 +714,20 @@ class AIPanel(QWidget):
 
     def _start_assistant_bubble(self) -> None:
         """Insert the opening HTML for an assistant message bubble."""
+        if self._backend == self._BACKEND_CLAUDE:
+            label = "🤖 Claude"
+            bg    = _ASST
+        else:
+            label = "🟢 ChatGPT"
+            bg    = "#1A2E1A"   # slightly green tint to distinguish
         cursor = self._chat.textCursor()
         cursor.movePosition(QTextCursor.End)
         cursor.insertHtml(
             f'<div style="'
-            f'background:{_ASST}; border-radius:8px; '
+            f'background:{bg}; border-radius:8px; '
             f'padding:8px 12px; margin:6px 2px 2px 2px;'
             f'">'
-            f'<span style="color:{_DIM}; font-size:8pt;">🤖 Claude</span><br>'
+            f'<span style="color:{_DIM}; font-size:8pt;">{label}</span><br>'
         )
         self._chat.setTextCursor(cursor)
         self._chat.ensureCursorVisible()
