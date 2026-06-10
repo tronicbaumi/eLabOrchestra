@@ -11,9 +11,10 @@ Tabs:
 from __future__ import annotations
 
 import math
+import threading
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QGroupBox,
@@ -66,8 +67,8 @@ class _BigVal(QFrame):
         row.addStretch()
         lay.addLayout(row)
 
-    def set(self, v: float, dec: int = 4) -> None:
-        self._v.setText(f"{v:.{dec}f}")
+    def set(self, v: float | None, dec: int = 4) -> None:
+        self._v.setText("—" if v is None else f"{v:.{dec}f}")
 
 
 # ── Harmonics bar-chart widget ────────────────────────────────────────────────
@@ -161,9 +162,14 @@ class _OverviewTab(QWidget):
 # ── Harmonics tab ─────────────────────────────────────────────────────────────
 
 class _HarmonicsTab(QWidget):
+    # carries worker-thread results back to the GUI thread (queued connection)
+    _harmonics_ready = Signal(list, list, int)
+
     def __init__(self, device):
         super().__init__()
         self._device = device
+        self._refresh_running = False
+        self._harmonics_ready.connect(self._apply_harmonics)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(8)
@@ -213,15 +219,37 @@ class _HarmonicsTab(QWidget):
         lay.addWidget(grp_i, 1)
 
     def refresh(self) -> None:
+        """Fetch harmonics on a worker thread (2·n serial queries would
+        freeze the GUI for seconds) and apply the result via signal."""
         if not self._device or not self._device.connected:
             return
+        if self._refresh_running:
+            return
+        self._refresh_running = True
+        self._btn_refresh.setEnabled(False)
+        self._btn_refresh.setText("⟳  Reading…")
         n = self._spin_orders.value()
-        u_harms, i_harms = self._device.measure_harmonics(max_order=n)
+        device = self._device
+
+        def worker() -> None:
+            try:
+                u_harms, i_harms = device.measure_harmonics(max_order=n)
+            except Exception:
+                u_harms, i_harms = [], []
+            self._harmonics_ready.emit(u_harms, i_harms, n)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_harmonics(self, u_harms: list, i_harms: list, n: int) -> None:
+        self._refresh_running = False
+        self._btn_refresh.setEnabled(True)
+        self._btn_refresh.setText("⟳  Refresh")
         self._chart_u.set_data(u_harms, f"Voltage harmonics  (1–{n})")
         self._chart_i.set_data(i_harms, f"Current harmonics  (1–{n})")
-        # THD from last channel measurement
+        # THD from last channel measurement (cached snapshot)
         try:
-            m = self._device._state.channels[self._device._active_ch - 1]
+            st = self._device.get_state()
+            m  = st.channels[st.active_chan - 1]
             self._lbl_uthd.setText(f"Voltage THD: {m.uthd:.2f} %")
             self._lbl_ithd.setText(f"Current THD: {m.ithd:.2f} %")
         except Exception:
@@ -400,7 +428,9 @@ class LMG450Panel(QWidget):
         if not self._device or not self._device.connected:
             return
         try:
-            m = self._device.measure_channel()
+            # cached snapshot — serial I/O happens on the driver poll thread
+            st = self._device.get_state()
+            m  = st.channels[st.active_chan - 1]
             ov = self._overview_tab
             ov.urms.set(m.urms,  4)
             ov.irms.set(m.irms,  5)
@@ -415,7 +445,7 @@ class LMG450Panel(QWidget):
 
             self._int_tab.update_values(m.wh, m.ah, m.itime)
 
-            a = self._device.measure_aggregate()
+            a = st.aggregate
             ag = self._agg_tab
             ag.psum.set(a.psum,   4)
             ag.qsum.set(a.qsum,   4)

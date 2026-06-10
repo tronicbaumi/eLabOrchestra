@@ -83,7 +83,8 @@ class BigValueDisplay(QFrame):
         show_phase = m.mode in (MeasureMode.Z, MeasureMode.Theta)
         self._lbl_phase.setVisible(show_phase)
         if show_phase:
-            self._lbl_phase.setText(f"Phase: {m.phase:.2f}°")
+            self._lbl_phase.setText(
+                "Phase: —" if m.phase is None else f"Phase: {m.phase:.2f}°")
 
 
 class ControlPanel(QGroupBox):
@@ -218,5 +219,6 @@ class MeasurementPanel(QWidget):
         self._timer.start(500)
 
     def _refresh(self) -> None:
-        m = self._device.measure()
+        # cached snapshot — serial I/O happens on the driver poll thread
+        m = self._device.last_measurement()
         self._display.update_measurement(m)

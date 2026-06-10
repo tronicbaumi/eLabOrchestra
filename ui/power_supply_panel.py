@@ -54,8 +54,8 @@ class _BigValue(QFrame):
         row.addStretch()
         lay.addLayout(row)
 
-    def set_value(self, v: float, decimals: int = 3) -> None:
-        self._lbl_val.setText(f"{v:.{decimals}f}")
+    def set_value(self, v: float | None, decimals: int = 3) -> None:
+        self._lbl_val.setText("—" if v is None else f"{v:.{decimals}f}")
 
 
 class PowerSupplyPanel(QWidget):
@@ -234,7 +234,8 @@ class PowerSupplyPanel(QWidget):
         if not self._device or not self._device.connected:
             return
         try:
-            state = self._device.measure()
+            # cached snapshot — serial I/O happens on the driver poll thread
+            state = self._device.get_state()
             self._disp_v.set_value(state.meas_voltage, 3)
             self._disp_i.set_value(state.meas_current, 3)
             self._disp_p.set_value(state.power,        3)

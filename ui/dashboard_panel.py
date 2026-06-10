@@ -328,7 +328,9 @@ class _TextDisplay(QWidget):
         self._label = label; self._colour = colour; self.update()
 
     def set_value(self, value) -> None:
-        if isinstance(value, float):
+        if value is None:
+            self._value = "—"
+        elif isinstance(value, float):
             self._value = f"{value:.3f}"
         else:
             self._value = str(value)
@@ -1293,6 +1295,8 @@ class DashboardPanel(QWidget):
 
     def set_gauge(self, name: str, value: float,
                   min_val: float = 0, max_val: float = 100) -> None:
+        if value is None:   # no reading received — ignore, don't show 0
+            return
         self._emit("gauge_value", name, {"value": value, "min": min_val, "max": max_val})
 
     def config_gauge(self, name: str, label: str = "", min_val: float = 0,
@@ -1312,6 +1316,8 @@ class DashboardPanel(QWidget):
     # ── Y-T chart ─────────────────────────────────────────────────────────────
 
     def plot_yt(self, name: str, value: float) -> None:
+        if value is None:   # no reading received — ignore, don't plot 0
+            return
         self._emit("yt_point", name, {"value": value})
 
     def config_yt(self, name: str, label: str = "", colour: str = "#4CAF50",
@@ -1327,6 +1333,8 @@ class DashboardPanel(QWidget):
     # ── X-Y chart ─────────────────────────────────────────────────────────────
 
     def plot_xy(self, name: str, x: float, y: float) -> None:
+        if x is None or y is None:   # no reading received — ignore
+            return
         self._emit("xy_point", name, {"x": x, "y": y})
 
     def config_xy(self, name: str, label: str = "", colour: str = "#FF9800") -> None:

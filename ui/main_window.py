@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QInputDialog, QSplitter,
 )
 
-from instruments import HantekRLC1733C, OwonSP3103, LMG450, MagtrolDSP7000, Array3721A
+from instruments import HantekRLC1733C, OwonSP3103, LMG450, MagtrolDSP7000, Array3721A, X2CScopeDriver
 from scratch import BlocklyCanvas, BlocklyExecutor, BlockProgram
 from config import ConfigManager
 from .measurement_panel import MeasurementPanel
@@ -27,6 +27,8 @@ from .dsp7000_panel import DSP7000Panel
 from .uart_terminal_panel import UartTerminalPanel
 from .ai_panel import AIPanel
 from .eload_panel import ELoadPanel
+from .x2cscope_panel import X2CScopePanel
+from .data_graph_panel import DataGraphPanel
 
 _DARK   = "#1A1A2A"
 _CARD   = "#252535"
@@ -81,6 +83,7 @@ class _InstrumentConn(QObject):
     def do_connect(self) -> bool:
         ok, info = self._device.connect_with_config(self._serial_cfg)
         if ok:
+            self._start_polling()
             self.status_changed.emit("Connected", "#4CAF50")
         else:
             self._emit_disconnected()
@@ -88,18 +91,28 @@ class _InstrumentConn(QObject):
         return True
 
     def do_disconnect(self) -> None:
-        self._device.disconnect()
+        self._device.disconnect()   # also stops the driver poll thread
         self._emit_disconnected()
 
     def do_connect_with_warning(self, parent_widget) -> None:
         """connect and show QMessageBox on failure."""
         ok, info = self._device.connect_with_config(self._serial_cfg)
         if ok:
+            self._start_polling()
             self.status_changed.emit("Connected", "#4CAF50")
         else:
             self._emit_disconnected()
             QMessageBox.warning(parent_widget, "Connection Failed",
                                 f"Could not connect:\n{info}")
+
+    def _start_polling(self) -> None:
+        """All serial I/O runs on the driver's poll thread; panels only read
+        cached snapshots, so the GUI never blocks on the serial port."""
+        if hasattr(self._device, "start_polling"):
+            try:
+                self._device.start_polling(0.5)
+            except Exception:
+                pass
 
     def _emit_disconnected(self) -> None:
         self.status_changed.emit("Disconnected", "#f44336")
@@ -159,6 +172,11 @@ class _StatusStrip(QFrame):
 # ── main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    # Executor callbacks fire on Blockly worker threads; these signals
+    # marshal them onto the GUI thread (auto → queued connection).
+    _exec_show = Signal(str, object)
+    _exec_log  = Signal(str, object)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("eLabOrchestra")
@@ -171,6 +189,7 @@ class MainWindow(QMainWindow):
         self._lmg    = LMG450()
         self._dsp    = MagtrolDSP7000()
         self._eload  = Array3721A()
+        self._x2c    = X2CScopeDriver()
 
         # ── connection helpers (hold serial config, no UI) ────────────────────
         self._lcr_conn   = _InstrumentConn(self._device, parent=self)
@@ -178,12 +197,14 @@ class MainWindow(QMainWindow):
         self._lmg_conn   = _InstrumentConn(self._lmg,    parent=self)
         self._dsp_conn   = _InstrumentConn(self._dsp,    parent=self)
         self._eload_conn = _InstrumentConn(self._eload,  parent=self)
+        self._x2c_conn   = _InstrumentConn(self._x2c,   parent=self)
 
         self._config    = ConfigManager()
         self._dashboard = DashboardPanel()
         self._executor  = BlocklyExecutor(
             device=self._device, psu=self._psu, lmg=self._lmg,
-            dsp=self._dsp, dashboard=self._dashboard, eload=self._eload)
+            dsp=self._dsp, dashboard=self._dashboard, eload=self._eload,
+            x2c=self._x2c)
 
         self._build_ui()
         self._build_menu()
@@ -231,6 +252,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            x2c_cfg = cfg.get("x2c") or {}
+            if x2c_cfg:
+                self._x2c.apply_config(x2c_cfg)
+            d = cfg.get("x2c_serial") or {}
+            self._x2c_conn.set_serial_config(
+                SerialConfig.from_dict(d) if d else SerialConfig(baudrate=115200))
+        except Exception:
+            pass
+
         # auto-connect all instruments
         self._lcr_conn.do_connect()
         self._psu_conn.do_connect()
@@ -253,6 +284,9 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # X2Cscope panel created early so its signal can be passed to the strip
+        self._x2c_panel = X2CScopePanel(self._x2c)
+
         # slim read-only status strip
         self._status_strip = _StatusStrip([
             ("Hantek RLC 1733C",       self._lcr_conn),
@@ -260,6 +294,7 @@ class MainWindow(QMainWindow):
             ("ZES Zimmer LMG450",      self._lmg_conn),
             ("Magtrol DSP7000",        self._dsp_conn),
             ("Array 3721A",            self._eload_conn),
+            ("X2Cscope",               self._x2c_conn),
         ])
         root.addWidget(self._status_strip)
 
@@ -285,6 +320,8 @@ class MainWindow(QMainWindow):
         self._eload_panel = ELoadPanel(self._eload)
         left.addTab(self._eload_panel, "🔋  E-Load")
 
+        left.addTab(self._x2c_panel, "🔌  X2Cscope")
+
         self._log_panel = LogPanel(self._device, self._psu, self._lmg, self._dsp,
                                    eload=self._eload)
         left.addTab(self._log_panel, "📋  Data Log")
@@ -297,6 +334,9 @@ class MainWindow(QMainWindow):
         self._scratch = BlocklyCanvas()
         right_tabs.addTab(self._scratch, "🔧  Blockly")
         right_tabs.addTab(self._dashboard, "📊  Dashboard")
+
+        self._data_graph = DataGraphPanel(self._log_panel)
+        right_tabs.addTab(self._data_graph, "📈  Data Graph")
 
         self._uart_terminal = UartTerminalPanel({
             "Hantek RLC 1733C":  self._device,
@@ -414,6 +454,15 @@ class MainWindow(QMainWindow):
         eload_menu.addAction("Enable Input",  lambda: self._eload_input(True))
         eload_menu.addAction("Disable Input", lambda: self._eload_input(False))
 
+        # ── X2Cscope ──────────────────────────────────────────────────────────
+        x2c_menu = mb.addMenu("&X2Cscope")
+        x2c_menu.addAction("Serial Port Configuration…", self._open_x2c_uart_config)
+        x2c_menu.addSeparator()
+        x2c_menu.addAction("Connect",    self._x2c_connect)
+        x2c_menu.addAction("Disconnect", self._x2c_disconnect)
+        x2c_menu.addSeparator()
+        x2c_menu.addAction("Load ELF File…", self._x2c_load_elf)
+
         # ── Blockly ───────────────────────────────────────────────────────────
         blockly_menu = mb.addMenu("&Blockly")
         blockly_menu.addAction("Clear Workspace",  self._new_program,      "Ctrl+Shift+N")
@@ -467,27 +516,49 @@ class MainWindow(QMainWindow):
         self._scratch.run_requested.connect(self._run_program)
         self._scratch.stop_requested.connect(self._stop_program)
 
-        def on_show(label, value):
-            msg = f"{label} = {value}"
-            self._status.showMessage(msg, 4000)
-            self._scratch.set_message(msg)
+        # Executor callbacks arrive on worker threads — never touch Qt
+        # widgets there; emit signals instead (queued to the GUI thread).
+        self._exec_show.connect(self._on_exec_show)
+        self._exec_log.connect(self._on_exec_log)
+        self._executor.add_show_callback(
+            lambda label, value: self._exec_show.emit(label, value))
+        self._executor.add_log_callback(
+            lambda label, value: self._exec_log.emit(label, value))
 
-        def on_log(label, value):
-            self._log_panel.log_external(label, value)
+    def _on_exec_show(self, label, value) -> None:
+        msg = f"{label} = {value}"
+        self._status.showMessage(msg, 4000)
+        self._scratch.set_message(msg)
 
-        self._executor.add_show_callback(on_show)
-        self._executor.add_log_callback(on_log)
+    def _on_exec_log(self, label, value) -> None:
+        self._log_panel.log_external(label, value)
 
     # ── Blockly actions ───────────────────────────────────────────────────────
 
     def _set_instrument_polling(self, active: bool) -> None:
-        """Pause or resume all instrument panel timers (but not the log timer)."""
+        """Pause or resume instrument polling (but not the log timer).
+
+        Stops both the panel display timers and the drivers' background
+        poll threads, so a running Blockly program has the serial buses to
+        itself."""
         for panel in (self._meas_panel, self._psu_panel,
-                      self._lmg_panel, self._dsp_panel, self._eload_panel):
+                      self._lmg_panel, self._dsp_panel, self._eload_panel,
+                      self._x2c_panel):
             if active:
                 panel._timer.start(500)
             else:
                 panel._timer.stop()
+
+        for dev in (self._device, self._psu, self._lmg, self._dsp,
+                    self._eload, self._x2c):
+            try:
+                if active:
+                    if getattr(dev, "connected", False) and hasattr(dev, "start_polling"):
+                        dev.start_polling(0.5)
+                elif hasattr(dev, "stop_polling"):
+                    dev.stop_polling()
+            except Exception:
+                pass
 
     def _set_blockly_running(self, running: bool) -> None:
         self._tb_run.setEnabled(not running)
@@ -760,6 +831,35 @@ class MainWindow(QMainWindow):
                     pass
             self._status.showMessage(f"Profile '{name}' loaded.")
 
+    # ── X2Cscope actions ──────────────────────────────────────────────────────
+
+    def _open_x2c_uart_config(self) -> None:
+        dlg = UartConfigDialog(self._x2c_conn.serial_cfg, parent=self)
+        if dlg.exec():
+            self._x2c_conn.set_serial_config(dlg.config)
+            if self._x2c.connected:
+                self._x2c.disconnect()
+            self._x2c_conn.do_connect_with_warning(self)
+            self._status.showMessage(
+                f"X2Cscope serial port: {dlg.config.port}  {dlg.config.baudrate}")
+
+    def _x2c_connect(self) -> None:
+        if not self._x2c.connected:
+            self._x2c_conn.do_connect_with_warning(self)
+
+    def _x2c_disconnect(self) -> None:
+        if self._x2c.connected:
+            self._x2c_conn.do_disconnect()
+            self._status.showMessage("X2Cscope disconnected.")
+
+    def _x2c_load_elf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open ELF File", str(Path.home()),
+            "ELF Files (*.elf *.axf *.out);;All Files (*)")
+        if path:
+            self._x2c_panel._elf_edit.setText(path)
+            self._x2c_panel._load_elf()
+
     # ── Help ──────────────────────────────────────────────────────────────────
 
     def _about(self) -> None:
@@ -784,9 +884,13 @@ class MainWindow(QMainWindow):
         self._config.set("lmg_serial",   self._lmg_conn.serial_cfg.to_dict())
         self._config.set("eload_device", self._eload.get_config())
         self._config.set("eload_serial", self._eload_conn.serial_cfg.to_dict())
+        self._config.set("x2c",          self._x2c.get_config())
+        self._config.set("x2c_serial",   self._x2c_conn.serial_cfg.to_dict())
         self._config.save("last_session")
         self._device.disconnect()
         self._psu.disconnect()
         self._lmg.disconnect()
+        self._dsp.disconnect()
         self._eload.disconnect()
+        self._x2c.disconnect()
         event.accept()

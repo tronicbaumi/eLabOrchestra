@@ -458,7 +458,8 @@ class _ChannelPanel(QWidget):
 
     def refresh(self) -> None:
         try:
-            cd = self._dsp.read_channel(self._ch)
+            # cached snapshot — serial I/O happens on the driver poll thread
+            cd = self._dsp.get_state().ch(self._ch)
             self._strip.update(cd)
         except Exception:
             pass

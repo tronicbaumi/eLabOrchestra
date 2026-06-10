@@ -7,12 +7,10 @@ live data.  Logging interval is configurable.
 
 Performance note
 ────────────────
-LCR: measure() → one FETCh? query  (~50 ms)
-PSU: reads from cached _state (no extra serial round-trip)
-LMG: reads from cached _state (15+ queries/channel avoided)
-DSP: reads from cached _state (no extra serial round-trip)
-
-The instrument panel QTimers (500 ms) keep those _state caches fresh.
+All instruments are read from their drivers' thread-safe cached snapshots
+(get_state() / last_measurement()) — no serial round-trips on the GUI
+thread.  The drivers' background poll threads (500 ms) keep the caches
+fresh.
 """
 
 from __future__ import annotations
@@ -414,9 +412,8 @@ class LogPanel(QWidget):
 
     def _build_snap(self) -> dict:
         """
-        Collect one measurement snapshot.
-        LCR: fresh query; PSU/LMG/DSP: read cached _state (already updated
-        by the instrument panel QTimers at 500 ms).
+        Collect one measurement snapshot from the drivers' thread-safe
+        cached state — no serial I/O on the GUI thread.
         """
         # Build prefix set once instead of calling any(startswith) per check
         prefixes: set[str] = set()
@@ -426,36 +423,29 @@ class LogPanel(QWidget):
         snap: dict = {}
 
         if "lcr" in prefixes:
-            snap["lcr"] = self._lcr.measure() if self._lcr.connected else None
+            snap["lcr"] = (self._lcr.last_measurement()
+                           if self._lcr.connected else None)
 
         if self._psu and "psu" in prefixes:
-            snap["psu"] = self._psu._state if self._psu.connected else None
+            snap["psu"] = self._psu.get_state() if self._psu.connected else None
 
-        if self._lmg:
-            lmg_connected = self._lmg.connected
+        if self._lmg and self._lmg.connected:
+            lmg_state = self._lmg.get_state()
             for ch in range(1, 5):
                 if f"lmg{ch}" in prefixes:
-                    snap[f"lmg_ch{ch}"] = (
-                        self._lmg._state.channels[ch - 1]
-                        if lmg_connected else None
-                    )
+                    snap[f"lmg_ch{ch}"] = lmg_state.channels[ch - 1]
             if "lmg" in prefixes:
-                snap["lmg_agg"] = (
-                    self._lmg._state.aggregate
-                    if lmg_connected else None
-                )
+                snap["lmg_agg"] = lmg_state.aggregate
 
-        if self._dsp:
-            dsp_connected = self._dsp.connected
+        if self._dsp and self._dsp.connected:
+            dsp_state = self._dsp.get_state()
             for ch in (1, 2):
                 if f"dsp{ch}" in prefixes:
-                    snap[f"dsp_ch{ch}"] = (
-                        self._dsp._state.channels[ch - 1]
-                        if dsp_connected else None
-                    )
+                    snap[f"dsp_ch{ch}"] = dsp_state.channels[ch - 1]
 
         if self._eload and "eload" in prefixes:
-            snap["eload"] = self._eload._state if self._eload.connected else None
+            snap["eload"] = (self._eload.get_state()
+                             if self._eload.connected else None)
 
         return snap
 
@@ -467,7 +457,9 @@ class LogPanel(QWidget):
         for key in self._active_keys:
             try:
                 val = _FIELD_MAP[key].fetch(snap)
-                row[key] = "" if val == "" else (
+                # None / "" = no value received → leave the cell empty,
+                # never substitute a zero
+                row[key] = "" if val is None or val == "" else (
                     f"{val:.6g}" if isinstance(val, float) else str(val)
                 )
             except Exception:

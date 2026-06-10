@@ -64,40 +64,53 @@ from typing import Callable, Optional
 
 # ── data classes ──────────────────────────────────────────────────────────────
 
+def _safe_float(raw: str | None) -> float | None:
+    """Parse an instrument response; None for empty/unparseable (never 0)."""
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class ChannelMeasurement:
-    """One snapshot for a single LMG450 channel."""
+    """One snapshot for a single LMG450 channel.
+
+    All measured values are None until a valid response has been received
+    from the instrument — a missing response is never reported as 0.0."""
     channel:     int   = 1
     # basic
-    urms:        float = 0.0    # V  – true RMS voltage
-    irms:        float = 0.0    # A  – true RMS current
-    p:           float = 0.0    # W  – active power
-    q:           float = 0.0    # VAr – reactive power
-    s:           float = 0.0    # VA  – apparent power
-    lamda:       float = 0.0    # –   – power factor (signed)
-    phi:         float = 0.0    # °   – phase angle
-    fu:          float = 50.0   # Hz  – frequency
-    ubdc:        float = 0.0    # V   – DC voltage
-    ibdc:        float = 0.0    # A   – DC current
+    urms:        float | None = None   # V  – true RMS voltage
+    irms:        float | None = None   # A  – true RMS current
+    p:           float | None = None   # W  – active power
+    q:           float | None = None   # VAr – reactive power
+    s:           float | None = None   # VA  – apparent power
+    lamda:       float | None = None   # –   – power factor (signed)
+    phi:         float | None = None   # °   – phase angle
+    fu:          float | None = None   # Hz  – frequency
+    ubdc:        float | None = None   # V   – DC voltage
+    ibdc:        float | None = None   # A   – DC current
     # integration
-    wh:          float = 0.0    # Wh  – energy
-    ah:          float = 0.0    # Ah  – charge
-    itime:       float = 0.0    # s   – elapsed integration time
+    wh:          float | None = None   # Wh  – energy
+    ah:          float | None = None   # Ah  – charge
+    itime:       float | None = None   # s   – elapsed integration time
     # harmonics
     u_harmonics: list[float] = field(default_factory=list)   # [0]=DC,  [1]=fund, …
     i_harmonics: list[float] = field(default_factory=list)
-    uthd:        float = 0.0    # % voltage THD
-    ithd:        float = 0.0    # % current THD
+    uthd:        float | None = None   # % voltage THD
+    ithd:        float | None = None   # % current THD
 
 
 @dataclass
 class AggregateMeasurement:
-    """Sum values across all active channels."""
-    psum:   float = 0.0   # W
-    qsum:   float = 0.0   # VAr
-    ssum:   float = 0.0   # VA
-    wpsum:  float = 0.0   # Wh
-    ahpsum: float = 0.0   # Ah
+    """Sum values across all active channels (None = no data received)."""
+    psum:   float | None = None   # W
+    qsum:   float | None = None   # VAr
+    ssum:   float | None = None   # VA
+    wpsum:  float | None = None   # Wh
+    ahpsum: float | None = None   # Ah
 
 
 @dataclass
@@ -168,7 +181,11 @@ class LMG450:
 
     def __init__(self) -> None:
         self._dev       = None
-        self._lock      = threading.Lock()
+        # _io_lock serialises serial transactions; one full channel sweep is
+        # a single transaction so values always belong to the same channel.
+        # _state_lock guards the cached _state (never held during I/O).
+        self._io_lock    = threading.Lock()
+        self._state_lock = threading.Lock()
         self._connected = False
         self._log_cb    = None
         self._active_ch = 1
@@ -209,77 +226,89 @@ class LMG450:
         if not port:
             return False, "No port specified"
         try:
-            self._dev = _SerialLMG450(port, baudrate, timeout, log=self._log)
-            idn = self._dev.query("*IDN?")
+            dev = _SerialLMG450(port, baudrate, timeout, log=self._log)
+            idn = dev.query("*IDN?")
             if not idn:
-                self._dev.close()
-                self._dev = None
+                dev.close()
                 return False, "No response to *IDN? — wrong port or device not ready"
-            self._dev.write("CONT ON")
+            dev.write("CONT ON")
+            with self._io_lock:
+                self._dev = dev
             self._port_info = f"{port}  {baudrate} bps  |  {idn}"
             self._connected = True
             return True, self._port_info
         except Exception as e:
-            self._dev = None
             return False, str(e)
 
     def connect_with_config(self, cfg) -> tuple[bool, str]:
         return self.connect(port=cfg.port, baudrate=cfg.baudrate, timeout=cfg.timeout)
 
     def disconnect(self) -> None:
-        self.stop_polling()
-        if self._dev:
-            try:
-                self._dev.write("CONT OFF")
-                self._dev.close()
-            except Exception:
-                pass
-            self._dev = None
         self._connected = False
+        self.stop_polling()
+        # take the I/O lock so the port is never closed mid-transaction
+        with self._io_lock:
+            if self._dev:
+                try:
+                    self._dev.write("CONT OFF")
+                    self._dev.close()
+                except Exception:
+                    pass
+                self._dev = None
 
     # ── single-channel measurement ────────────────────────────────────────────
 
     def select_channel(self, ch: int) -> None:
         ch = max(1, min(self.N_CHANNELS, int(ch)))
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write(f"ACHAN {ch}")
-        self._active_ch = ch
+            self._active_ch = ch
 
     def set_averaging(self, n: int) -> None:
         n = max(1, min(128, int(n)))
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write(f"AVRG {n}")
         self._averaging = n
 
     def measure_channel(self, ch: int | None = None) -> ChannelMeasurement:
-        if ch is not None:
-            self.select_channel(ch)
-        m = ChannelMeasurement(channel=self._active_ch)
-        with self._lock:
+        """Sweep all values of one channel (blocking serial I/O).  Runs on
+        the poll thread in normal operation; UI code should read get_state().
+        The channel switch and the queries form one atomic transaction so all
+        values are guaranteed to come from the same channel."""
+        with self._io_lock:
+            if ch is not None:
+                ch = max(1, min(self.N_CHANNELS, int(ch)))
+                if self._dev:
+                    self._dev.write(f"ACHAN {ch}")
+                self._active_ch = ch
+            m = ChannelMeasurement(channel=self._active_ch)
             if not self._dev:
                 return m
             q = self._dev.query
             try:
-                m.urms  = float(q("UTRMS?") or 0)
-                m.irms  = float(q("ITRMS?") or 0)
-                m.p     = float(q("P?")     or 0)
-                m.q     = float(q("Q?")     or 0)
-                m.s     = float(q("S?")     or 0)
-                m.lamda = float(q("LAMDA?") or 0)
-                m.phi   = float(q("PHI?")   or 0)
-                m.fu    = float(q("FU?")    or 0)
-                m.ubdc  = float(q("UBDC?")  or 0)
-                m.ibdc  = float(q("IBDC?")  or 0)
-                m.wh    = float(q("WH?")    or 0)
-                m.ah    = float(q("AH?")    or 0)
-                m.itime = float(q("ITIME?") or 0)
-                m.uthd  = float(q("UTHD?")  or 0)
-                m.ithd  = float(q("ITHD?")  or 0)
+                # missing/garbled responses stay None — never 0
+                m.urms  = _safe_float(q("UTRMS?"))
+                m.irms  = _safe_float(q("ITRMS?"))
+                m.p     = _safe_float(q("P?"))
+                m.q     = _safe_float(q("Q?"))
+                m.s     = _safe_float(q("S?"))
+                m.lamda = _safe_float(q("LAMDA?"))
+                m.phi   = _safe_float(q("PHI?"))
+                m.fu    = _safe_float(q("FU?"))
+                m.ubdc  = _safe_float(q("UBDC?"))
+                m.ibdc  = _safe_float(q("IBDC?"))
+                m.wh    = _safe_float(q("WH?"))
+                m.ah    = _safe_float(q("AH?"))
+                m.itime = _safe_float(q("ITIME?"))
+                m.uthd  = _safe_float(q("UTHD?"))
+                m.ithd  = _safe_float(q("ITHD?"))
             except Exception:
                 pass
-        self._state.channels[self._active_ch - 1] = m
+        with self._state_lock:
+            self._state.channels[m.channel - 1] = m
+            self._state.active_chan = m.channel
         return m
 
     def measure_harmonics(self, ch: int | None = None,
@@ -287,13 +316,16 @@ class LMG450:
         """
         Returns (u_harmonics, i_harmonics) each as a list of `max_order` floats.
         Index 0 = fundamental (n=1), index 1 = 2nd harmonic, …
+        Blocking serial I/O (2·max_order queries) — call from a worker thread.
         """
-        if ch is not None:
-            self.select_channel(ch)
         u_harms, i_harms = [], []
-        with self._lock:
+        with self._io_lock:
             if not self._dev:
                 return u_harms, i_harms
+            if ch is not None:
+                ch = max(1, min(self.N_CHANNELS, int(ch)))
+                self._dev.write(f"ACHAN {ch}")
+                self._active_ch = ch
             for n in range(1, max_order + 1):
                 try:
                     u_harms.append(float(self._dev.query(f"UHAR{n}?") or 0))
@@ -306,12 +338,14 @@ class LMG450:
     def measure_single_harmonic(self, ch: int, order: int,
                                 kind: str = "U") -> float:
         """kind = 'U' (voltage) or 'I' (current)."""
-        self.select_channel(ch)
         cmd = f"{'U' if kind.upper()=='U' else 'I'}HAR{order}?"
-        with self._lock:
+        with self._io_lock:
             if not self._dev:
                 return 0.0
             try:
+                ch = max(1, min(self.N_CHANNELS, int(ch)))
+                self._dev.write(f"ACHAN {ch}")
+                self._active_ch = ch
                 return float(self._dev.query(cmd) or 0)
             except Exception:
                 return 0.0
@@ -320,35 +354,50 @@ class LMG450:
 
     def measure_aggregate(self) -> AggregateMeasurement:
         a = AggregateMeasurement()
-        with self._lock:
+        with self._io_lock:
             if not self._dev:
                 return a
             q = self._dev.query
             try:
-                a.psum   = float(q("PSUM?")   or 0)
-                a.qsum   = float(q("QSUM?")   or 0)
-                a.ssum   = float(q("SSUM?")   or 0)
-                a.wpsum  = float(q("WPSUM?")  or 0)
-                a.ahpsum = float(q("AHPSUM?") or 0)
+                # missing/garbled responses stay None — never 0
+                a.psum   = _safe_float(q("PSUM?"))
+                a.qsum   = _safe_float(q("QSUM?"))
+                a.ssum   = _safe_float(q("SSUM?"))
+                a.wpsum  = _safe_float(q("WPSUM?"))
+                a.ahpsum = _safe_float(q("AHPSUM?"))
             except Exception:
                 pass
-        self._state.aggregate = a
+        with self._state_lock:
+            self._state.aggregate = a
         return a
+
+    # ── state snapshot ────────────────────────────────────────────────────────
+
+    def get_state(self) -> LMG450State:
+        """Thread-safe snapshot of the last known state — no serial I/O.
+        ChannelMeasurement objects are replaced wholesale by the poll thread,
+        never mutated in place, so sharing references is safe."""
+        with self._state_lock:
+            return LMG450State(
+                channels    = list(self._state.channels),
+                aggregate   = self._state.aggregate,
+                active_chan = self._state.active_chan,
+            )
 
     # ── integration control ───────────────────────────────────────────────────
 
     def integration_start(self) -> None:
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write("STRTITIME")
 
     def integration_stop(self) -> None:
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write("STPTITIME")
 
     def integration_reset(self) -> None:
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write("RSTITIME")
 
@@ -370,12 +419,14 @@ class LMG450:
 
     def start_polling(self, interval: float = 0.5,
                       channels: list[int] | None = None) -> None:
+        """Poll the active channel + aggregates in a background thread.
+        The `channels` argument is kept for backwards compatibility; when
+        omitted, the currently active channel is polled."""
         if self._poll_thread and self._poll_thread.is_alive():
             return
         self._stop_evt.clear()
-        chans = channels or [1]
         self._poll_thread = threading.Thread(
-            target=self._poll_loop, args=(interval, chans), daemon=True)
+            target=self._poll_loop, args=(interval, channels), daemon=True)
         self._poll_thread.start()
 
     def stop_polling(self) -> None:
@@ -384,15 +435,22 @@ class LMG450:
             self._poll_thread.join(timeout=3.0)
             self._poll_thread = None
 
-    def _poll_loop(self, interval: float, channels: list[int]) -> None:
+    def _poll_loop(self, interval: float,
+                   channels: list[int] | None) -> None:
         while not self._stop_evt.is_set():
             if self._connected:
-                for ch in channels:
-                    self.measure_channel(ch)
+                if channels:
+                    for ch in channels:
+                        if self._stop_evt.is_set():
+                            break
+                        self.measure_channel(ch)
+                else:
+                    self.measure_channel()   # active channel
                 self.measure_aggregate()
+                state = self.get_state()
                 for cb in list(self._poll_cbs):
                     try:
-                        cb(self._state)
+                        cb(state)
                     except Exception:
                         pass
             self._stop_evt.wait(interval)

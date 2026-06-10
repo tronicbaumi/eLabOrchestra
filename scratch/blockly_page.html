@@ -58,6 +58,7 @@ const COLOUR = {
   LOGGING:     '#9966FF',
   PSU:         '#43A047',   // power supply — green
   LMG:         '#9C27B0',   // LMG450 power analyser — violet
+  X2C:         '#FF6F00',   // X2Cscope embedded target — amber
   DASH:        '#E64A19',   // Dashboard — deep orange
   DSP:         '#00838F',   // Magtrol DSP7000 — teal
 };
@@ -442,6 +443,30 @@ Blockly.defineBlocksWithJsonArray([
   "output": "Number", "colour": COLOUR.LMG,
   "tooltip": "Sum of apparent powers across all channels (VA)."
 },
+// ─ X2Cscope ─
+{
+  "type": "x2c_write_var",
+  "message0": "X2C write %1 = %2",
+  "args0": [
+    { "type": "field_input", "name": "VARNAME", "text": "AppData.myVar" },
+    { "type": "input_value", "name": "VALUE",   "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": COLOUR.X2C,
+  "tooltip": "Write a numeric value to a variable on the embedded target via X2Cscope."
+},
+{
+  "type": "x2c_read_var",
+  "message0": "X2C read %1",
+  "args0": [
+    { "type": "field_input", "name": "VARNAME", "text": "AppData.myVar" }
+  ],
+  "output": "Number",
+  "colour": COLOUR.X2C,
+  "tooltip": "Read the current value of a variable from the embedded target via X2Cscope."
+},
 ]);
 
 // ── Toolbox XML ───────────────────────────────────────────────────────────
@@ -622,6 +647,14 @@ const TOOLBOX = {
         { kind: "block", type: "dash_config_switch" },
         { kind: "block", type: "dash_set_switch" },
         { kind: "block", type: "dash_switch_state" },
+      ]
+    },
+    {
+      kind: "category", name: "X2Cscope", colour: COLOUR.X2C,
+      contents: [
+        { kind: "block", type: "x2c_write_var",
+          inputs: { VALUE: { shadow: { type: "math_number", fields: { NUM: 0 } } } } },
+        { kind: "block", type: "x2c_read_var" },
       ]
     },
     {

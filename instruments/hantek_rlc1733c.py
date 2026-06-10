@@ -116,8 +116,10 @@ _MODE_LABELS = {
 }
 
 
-def _eng(value: float, unit: str) -> str:
+def _eng(value: float | None, unit: str) -> str:
     """Format value with SI engineering prefix."""
+    if value is None:
+        return "—"
     if value == 0 or not math.isfinite(value):
         return f"0.000 {unit}"
     exp = int(math.floor(math.log10(abs(value)) / 3) * 3)
@@ -133,9 +135,9 @@ def _eng(value: float, unit: str) -> str:
 class Measurement:
     mode:      MeasureMode
     frequency: TestFrequency
-    primary:   float
-    secondary: float
-    phase:     float          # degrees; equals secondary when in Theta mode
+    primary:   float | None   # None = no valid reading received
+    secondary: float | None
+    phase:     float | None   # degrees; equals secondary when in Theta mode
     overload:  bool  = False
     hold:      bool  = False
     rel:       bool  = False
@@ -159,6 +161,8 @@ class Measurement:
 
     @property
     def secondary_str(self) -> str:
+        if self.secondary is None:
+            return "—"
         return f"{self.secondary:.4g} {self.secondary_unit}"
 
     @property
@@ -214,7 +218,10 @@ class HantekRLC1733C:
 
     def __init__(self) -> None:
         self._dev:   Optional[_SerialLCR] = None
-        self._lock   = threading.Lock()
+        # _io_lock serialises serial transactions; _state_lock guards the
+        # hold flag and cached measurements (never held during I/O).
+        self._io_lock    = threading.Lock()
+        self._state_lock = threading.Lock()
         self._connected   = False
         self._log_cb      = None
         self._serial_config: Optional[dict] = None
@@ -224,6 +231,7 @@ class HantekRLC1733C:
         self._freq   = TestFrequency.F1kHz
         self._hold   = False
         self._held_meas: Optional[Measurement] = None
+        self._last_meas: Optional[Measurement] = None
 
         self._poll_thread:  Optional[threading.Thread] = None
         self._poll_stop     = threading.Event()
@@ -314,7 +322,7 @@ class HantekRLC1733C:
 
     def disconnect(self) -> None:
         self.stop_polling()
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 try:
                     self._dev.write("*GTL")   # release keyboard lock
@@ -329,7 +337,7 @@ class HantekRLC1733C:
     def set_mode(self, mode: MeasureMode) -> None:
         self._mode = mode
         impa, impb, equiv = _MODE_SCPI.get(mode, ("C", "D", None))
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._log("TX", f"set_mode {mode.name}")
                 self._dev.write(f"FUNCtion:impa {impa}")
@@ -339,15 +347,16 @@ class HantekRLC1733C:
 
     def set_frequency(self, freq: TestFrequency) -> None:
         self._freq = freq
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._log("TX", f"set_frequency {freq.label}")
                 self._dev.write(f"FREQuency {freq.hz}")
 
     def set_hold(self, hold: bool) -> None:
-        self._hold = hold
-        if not hold:
-            self._held_meas = None
+        with self._state_lock:
+            self._hold = hold
+            if not hold:
+                self._held_meas = None
         self._log("TX", f"hold {'ON' if hold else 'OFF'}")
 
     def set_rel(self, rel: bool) -> None:
@@ -356,13 +365,13 @@ class HantekRLC1733C:
 
     def set_level(self, mv: int) -> None:
         """Set signal level: 300 or 600 (mVrms)."""
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write(f"FUNCtion:LEVel {mv}")
 
     def set_range(self, r: str) -> None:
         """Set range: 'AUTO', '10', '100', '1000', '10000', '100000'."""
-        with self._lock:
+        with self._io_lock:
             if self._dev:
                 self._dev.write(f"FUNCtion:RANGe {r}")
 
@@ -372,24 +381,41 @@ class HantekRLC1733C:
     # ── measurement ───────────────────────────────────────────────────────────
 
     def _default_measurement(self) -> Measurement:
+        # No data received — values stay None, never reported as 0
         return Measurement(mode=self._mode, frequency=self._freq,
-                           primary=0.0, secondary=0.0, phase=0.0)
+                           primary=None, secondary=None, phase=None)
 
     def measure(self) -> Measurement:
-        if self._hold and self._held_meas is not None:
-            return self._held_meas
+        """Query the instrument (blocking serial I/O).  Runs on the poll
+        thread in normal operation; UI code should read last_measurement()."""
+        with self._state_lock:
+            if self._hold and self._held_meas is not None:
+                return self._held_meas
 
-        with self._lock:
+        with self._io_lock:
             if not self._dev:
                 return self._default_measurement()
             try:
                 resp = self._dev.query("FETCh?")
-                m = self._parse_fetch(resp)
-                if self._hold:
-                    self._held_meas = m
-                return m
             except Exception:
                 return self._default_measurement()
+
+        m = self._parse_fetch(resp)
+        with self._state_lock:
+            self._last_meas = m
+            if self._hold:
+                self._held_meas = m
+        return m
+
+    def last_measurement(self) -> Measurement:
+        """Thread-safe snapshot of the most recent measurement — no serial
+        I/O.  Returns an empty measurement until the first poll completes."""
+        with self._state_lock:
+            if self._hold and self._held_meas is not None:
+                return self._held_meas
+            if self._last_meas is not None:
+                return self._last_meas
+        return self._default_measurement()
 
     def _parse_fetch(self, resp: str) -> Measurement:
         """
@@ -399,25 +425,26 @@ class HantekRLC1733C:
         parts = [p.strip() for p in resp.split(",")]
         overload = False
 
+        # Missing/unparseable values stay None — never reported as 0
         try:
             primary = float(parts[0])
             # Values ≥ 9.9E+37 indicate overload / out of range
             if not math.isfinite(primary) or abs(primary) >= 9.9e37:
                 overload = True
-                primary = 0.0
+                primary = None
         except (ValueError, IndexError):
             overload = True
-            primary = 0.0
+            primary = None
 
         try:
             secondary = float(parts[1])
             if not math.isfinite(secondary):
-                secondary = 0.0
+                secondary = None
         except (ValueError, IndexError):
-            secondary = 0.0
+            secondary = None
 
         # Phase: use secondary value when in theta/Z mode
-        phase = secondary if self._mode in (MeasureMode.Theta, MeasureMode.Z) else 0.0
+        phase = secondary if self._mode in (MeasureMode.Theta, MeasureMode.Z) else None
 
         return Measurement(
             mode=self._mode,

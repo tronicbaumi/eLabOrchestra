@@ -32,13 +32,14 @@ except ImportError:
 
 
 class ExecContext:
-    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None, eload=None) -> None:
+    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None, eload=None, x2c=None) -> None:
         self.device     = device
         self.psu        = psu
         self.lmg        = lmg
         self.dsp        = dsp
         self.dashboard  = dashboard
         self.eload      = eload
+        self.x2c        = x2c
         self._dsp_ch    = 1   # active channel for dsp commands
         self.variables: dict[str, Any] = {}
         self.running = True
@@ -58,13 +59,14 @@ class ExecContext:
 class BlocklyExecutor:
     """Runs a program dict (from BlocklyBridge.program) in background threads."""
 
-    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None, eload=None) -> None:
+    def __init__(self, device=None, psu=None, lmg=None, dsp=None, dashboard=None, eload=None, x2c=None) -> None:
         self._device     = device
         self._psu        = psu
         self._lmg        = lmg
         self._dsp        = dsp
         self._dashboard  = dashboard
         self._eload      = eload
+        self._x2c        = x2c
         self._threads: list[threading.Thread] = []
         self._ctx: Optional[ExecContext] = None
         self._show_cbs: list[Callable[[str, Any], None]] = []
@@ -81,7 +83,7 @@ class BlocklyExecutor:
         self.stop()
         ctx = ExecContext(device=self._device, psu=self._psu, lmg=self._lmg,
                           dsp=self._dsp, dashboard=self._dashboard,
-                          eload=self._eload)
+                          eload=self._eload, x2c=self._x2c)
         for cb in self._show_cbs: ctx.add_show_cb(cb)
         for cb in self._log_cbs:  ctx.add_log_cb(cb)
         self._ctx = ctx
@@ -225,7 +227,7 @@ class BlocklyExecutor:
             ctx.psu.set_output(state_str == "ON")
 
         elif btype == "psu_toggle_output" and ctx.psu:
-            ctx.psu.set_output(not ctx.psu._state.output_on)
+            ctx.psu.set_output(not ctx.psu.get_state().output_on)
 
         # ── LMG450 Power Analyser ─────────────────────────────────────────────
         elif btype == "lmg_select_channel" and ctx.lmg:
@@ -312,8 +314,9 @@ class BlocklyExecutor:
         # ── Dashboard / Visualization ─────────────────────────────────────────
         elif btype == "dash_set_gauge" and ctx.dashboard:
             name  = fields.get("NAME", "gauge1")
-            value = float(self._eval_input(inputs.get("VALUE"), ctx) or 0)
-            ctx.dashboard.set_gauge(name, value)
+            raw   = self._eval_input(inputs.get("VALUE"), ctx)
+            if raw is not None:   # no reading → skip, never show 0
+                ctx.dashboard.set_gauge(name, float(raw))
 
         elif btype == "dash_config_gauge" and ctx.dashboard:
             name   = fields.get("NAME",   "gauge1")
@@ -325,8 +328,9 @@ class BlocklyExecutor:
 
         elif btype == "dash_plot_yt" and ctx.dashboard:
             name  = fields.get("NAME", "chart1")
-            value = float(self._eval_input(inputs.get("VALUE"), ctx) or 0)
-            ctx.dashboard.plot_yt(name, value)
+            raw   = self._eval_input(inputs.get("VALUE"), ctx)
+            if raw is not None:   # no reading → skip, never plot 0
+                ctx.dashboard.plot_yt(name, float(raw))
 
         elif btype == "dash_config_yt" and ctx.dashboard:
             name   = fields.get("NAME",   "chart1")
@@ -336,10 +340,11 @@ class BlocklyExecutor:
             ctx.dashboard.config_yt(name, label, colour, window)
 
         elif btype == "dash_plot_xy" and ctx.dashboard:
-            name = fields.get("NAME", "xy1")
-            x    = float(self._eval_input(inputs.get("X"), ctx) or 0)
-            y    = float(self._eval_input(inputs.get("Y"), ctx) or 0)
-            ctx.dashboard.plot_xy(name, x, y)
+            name  = fields.get("NAME", "xy1")
+            raw_x = self._eval_input(inputs.get("X"), ctx)
+            raw_y = self._eval_input(inputs.get("Y"), ctx)
+            if raw_x is not None and raw_y is not None:   # skip incomplete points
+                ctx.dashboard.plot_xy(name, float(raw_x), float(raw_y))
 
         elif btype == "dash_config_xy" and ctx.dashboard:
             name   = fields.get("NAME",   "xy1")
@@ -419,6 +424,12 @@ class BlocklyExecutor:
             name  = fields.get("NAME",  "sw1")
             state = fields.get("STATE", "false") == "true"
             ctx.dashboard.set_switch(name, state)
+
+        # ── X2Cscope (embedded target variables) ─────────────────────────────
+        elif btype == "x2c_write_var" and ctx.x2c and ctx.x2c.connected:
+            var_name = fields.get("VARNAME", "")
+            value    = float(self._eval_input(inputs.get("VALUE"), ctx) or 0)
+            ctx.x2c.write_variable(var_name, value)
 
     # ── run a statement body ──────────────────────────────────────────────────
 
@@ -509,6 +520,11 @@ class BlocklyExecutor:
 
         if btype == "logic_negate":
             return not bool(self._eval_input(inputs.get("BOOL"), ctx))
+
+        # X2Cscope reporter
+        if btype == "x2c_read_var" and ctx.x2c and ctx.x2c.connected:
+            var_name = fields.get("VARNAME", "")
+            return ctx.x2c.read_variable(var_name)
 
         if btype == "text_join":
             parts = []

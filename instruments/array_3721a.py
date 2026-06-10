@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Callable
 
 
@@ -53,17 +53,33 @@ class ELoadMode:
 
 # ── state snapshot ────────────────────────────────────────────────────────────
 
+def _safe_float(raw: str | None, round_to: int | None = None) -> float | None:
+    """Parse an instrument response; None for empty/unparseable (never 0)."""
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return round(v, round_to) if round_to is not None else v
+
+
 @dataclass
 class ELoadState:
-    """Snapshot of one measurement / status cycle."""
+    """Snapshot of one measurement / status cycle.
+
+    meas_voltage / meas_current are None until a valid reading has been
+    received — a missing response is never reported as 0.0."""
     mode:         str   = ELoadMode.CCH
-    set_value:    float = 0.0   # A / V / Ω / W depending on mode
-    meas_voltage: float = 0.0   # V  (actual terminal)
-    meas_current: float = 0.0   # A  (actual terminal)
+    set_value:    float = 0.0            # A / V / Ω / W depending on mode
+    meas_voltage: float | None = None    # V  (actual terminal)
+    meas_current: float | None = None    # A  (actual terminal)
     input_on:     bool  = False
 
     @property
-    def power(self) -> float:
+    def power(self) -> float | None:
+        if self.meas_voltage is None or self.meas_current is None:
+            return None
         return round(self.meas_voltage * self.meas_current, 4)
 
 
@@ -127,13 +143,31 @@ class Array3721A:
 
     def __init__(self) -> None:
         self._dev        = None
-        self._lock       = threading.Lock()
+        # _io_lock serialises serial transactions (held per command);
+        # _state_lock guards the cached _state and is never held during I/O.
+        self._io_lock    = threading.Lock()
+        self._state_lock = threading.Lock()
         self._connected  = False
         self._log_cb     = None
         self._poll_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._state      = ELoadState()
         self._poll_cbs:  list[Callable[[ELoadState], None]] = []
+
+    # ── locked serial primitives ──────────────────────────────────────────────
+
+    def _write_cmd(self, cmd: str) -> bool:
+        with self._io_lock:
+            if not self._dev:
+                return False
+            self._dev.write(cmd)
+            return True
+
+    def _query_cmd(self, cmd: str) -> str | None:
+        with self._io_lock:
+            if not self._dev:
+                return None
+            return self._dev.query(cmd)
 
     # ── logging ───────────────────────────────────────────────────────────────
 
@@ -165,26 +199,27 @@ class Array3721A:
         if not port:
             return False, "No port specified"
         try:
-            self._dev = _SerialArray3721A(
+            dev = _SerialArray3721A(
                 port, baudrate, timeout, rtscts=rtscts, log=self._log)
-            idn = self._dev.query("*IDN?")
+            idn = dev.query("*IDN?")
             if not idn:
-                self._dev.close()
-                self._dev = None
+                dev.close()
                 return False, "No response to *IDN? — wrong port or device not ready"
-            self._dev.write("SYSTem:REMote")
-            self._port_info = f"{port}  {baudrate} bps  |  {idn}"
-            self._connected = True
-            # sync mode state from device
+            dev.write("SYSTem:REMote")
+            # sync mode state from device before publishing the connection
             try:
-                m = self._dev.query("MODE?").strip().upper()
+                m = dev.query("MODE?").strip().upper()
                 if m in ELoadMode.ALL:
-                    self._state.mode = m
+                    with self._state_lock:
+                        self._state.mode = m
             except Exception:
                 pass
+            with self._io_lock:
+                self._dev = dev
+            self._port_info = f"{port}  {baudrate} bps  |  {idn}"
+            self._connected = True
             return True, self._port_info
         except Exception as e:
-            self._dev = None
             return False, str(e)
 
     def connect_with_config(self, cfg) -> tuple[bool, str]:
@@ -193,15 +228,17 @@ class Array3721A:
                             timeout=cfg.timeout)
 
     def disconnect(self) -> None:
-        self.stop_polling()
-        if self._dev:
-            try:
-                self._dev.write("SYSTem:LOCal")
-                self._dev.close()
-            except Exception:
-                pass
-            self._dev = None
         self._connected = False
+        self.stop_polling()
+        # take the I/O lock so the port is never closed mid-transaction
+        with self._io_lock:
+            if self._dev:
+                try:
+                    self._dev.write("SYSTem:LOCal")
+                    self._dev.close()
+                except Exception:
+                    pass
+                self._dev = None
 
     # ── commands ──────────────────────────────────────────────────────────────
 
@@ -210,68 +247,73 @@ class Array3721A:
         mode = mode.upper()
         if mode not in ELoadMode.ALL:
             raise ValueError(f"Unknown mode: {mode!r}")
-        with self._lock:
-            if self._dev:
-                self._dev.write(f"MODE {mode}")
-        self._state.mode = mode
+        self._write_cmd(f"MODE {mode}")
+        with self._state_lock:
+            self._state.mode = mode
 
     def set_level(self, value: float) -> None:
         """Set the active set-point for the current mode."""
-        mode = self._state.mode
-        with self._lock:
-            if not self._dev:
-                return
-            if mode in (ELoadMode.CCL, ELoadMode.CCH):
-                limit = self.MAX_CURRENT_L if mode == ELoadMode.CCL else self.MAX_CURRENT
-                value = max(0.0, min(limit, float(value)))
-                self._dev.write(f"CURRent {value:.4f}")
-            elif mode == ELoadMode.CV:
-                value = max(0.0, min(self.MAX_VOLTAGE, float(value)))
-                self._dev.write(f"VOLTage {value:.4f}")
-            elif mode in (ELoadMode.CRL, ELoadMode.CRM, ELoadMode.CRH):
-                value = max(0.0, float(value))
-                self._dev.write(f"RESistance {value:.4f}")
-            elif mode in (ELoadMode.CPV, ELoadMode.CPC):
-                value = max(0.0, min(self.MAX_POWER, float(value)))
-                self._dev.write(f"POWer {value:.4f}")
-        self._state.set_value = value
+        with self._state_lock:
+            mode = self._state.mode
+        if mode in (ELoadMode.CCL, ELoadMode.CCH):
+            limit = self.MAX_CURRENT_L if mode == ELoadMode.CCL else self.MAX_CURRENT
+            value = max(0.0, min(limit, float(value)))
+            cmd = f"CURRent {value:.4f}"
+        elif mode == ELoadMode.CV:
+            value = max(0.0, min(self.MAX_VOLTAGE, float(value)))
+            cmd = f"VOLTage {value:.4f}"
+        elif mode in (ELoadMode.CRL, ELoadMode.CRM, ELoadMode.CRH):
+            value = max(0.0, float(value))
+            cmd = f"RESistance {value:.4f}"
+        elif mode in (ELoadMode.CPV, ELoadMode.CPC):
+            value = max(0.0, min(self.MAX_POWER, float(value)))
+            cmd = f"POWer {value:.4f}"
+        else:
+            return
+        if not self._write_cmd(cmd):
+            return
+        with self._state_lock:
+            self._state.set_value = value
 
     def set_input(self, on: bool) -> None:
         """Enable or disable the load input."""
-        with self._lock:
-            if self._dev:
-                self._dev.write("INPut ON" if on else "INPut OFF")
-        self._state.input_on = on
+        self._write_cmd("INPut ON" if on else "INPut OFF")
+        with self._state_lock:
+            self._state.input_on = on
 
     def measure(self) -> ELoadState:
-        """Query measured V, I and input state; return a snapshot."""
-        with self._lock:
-            if not self._dev:
-                return ELoadState()
-            try:
-                vraw = self._dev.query("MEASure:VOLTage?")
-                iraw = self._dev.query("MEASure:CURRent?")
-                inp  = self._dev.query("INPut?").strip()
-                self._state.meas_voltage = round(float(vraw or 0), 4)
-                self._state.meas_current = round(float(iraw or 0), 4)
-                self._state.input_on     = inp in ("1", "ON")
-            except Exception:
-                pass
-        return ELoadState(
-            mode         = self._state.mode,
-            set_value    = self._state.set_value,
-            meas_voltage = self._state.meas_voltage,
-            meas_current = self._state.meas_current,
-            input_on     = self._state.input_on,
-        )
+        """Query measured V, I and input state (blocking serial I/O) and
+        update the cached state.  Runs on the poll thread in normal
+        operation; UI code should read get_state() instead."""
+        if not self._dev:
+            return self.get_state()
+        try:
+            vraw = self._query_cmd("MEASure:VOLTage?")
+            iraw = self._query_cmd("MEASure:CURRent?")
+            inp  = self._query_cmd("INPut?")
+        except Exception:
+            vraw = iraw = inp = None
+        with self._state_lock:
+            # an empty/garbled response is "no data" (None), never 0
+            self._state.meas_voltage = _safe_float(vraw, round_to=4)
+            self._state.meas_current = _safe_float(iraw, round_to=4)
+            if inp is not None:
+                self._state.input_on = inp.strip() in ("1", "ON")
+            return replace(self._state)
+
+    def get_state(self) -> ELoadState:
+        """Thread-safe snapshot of the last known state — no serial I/O."""
+        with self._state_lock:
+            return replace(self._state)
 
     # ── config helpers ────────────────────────────────────────────────────────
 
     def get_config(self) -> dict:
-        return {
-            "mode":      self._state.mode,
-            "set_value": self._state.set_value,
-        }
+        with self._state_lock:
+            return {
+                "mode":      self._state.mode,
+                "set_value": self._state.set_value,
+            }
 
     def apply_config(self, cfg: dict) -> None:
         if "mode" in cfg:

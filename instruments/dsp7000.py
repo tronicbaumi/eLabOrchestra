@@ -42,11 +42,12 @@ except ImportError:
 
 @dataclass
 class ChannelData:
-    """Live measurement data for one channel."""
-    speed:     float = 0.0   # rpm
-    torque:    float = 0.0   # Nm (or configured units)
-    power:     float = 0.0   # W  (computed: 2π·n/60 · T)
-    direction: str   = "R"   # "R"=CW, "L"=CCW, "A"=alarm
+    """Live measurement data for one channel.
+    None = no valid reading received (never reported as 0)."""
+    speed:     float | None = None   # rpm
+    torque:    float | None = None   # Nm (or configured units)
+    power:     float | None = None   # W  (computed: 2π·n/60 · T)
+    direction: str   = ""            # "R"=CW, "L"=CCW, "A"=alarm
 
 
 @dataclass
@@ -95,9 +96,12 @@ class _SerialDSP7000:
         )
 
     def close(self) -> None:
-        if self._port and self._port.is_open:
-            self._port.close()
-        self._port = None
+        # taken under the transport lock so an in-flight query/send always
+        # completes before the port disappears
+        with self._lock:
+            if self._port and self._port.is_open:
+                self._port.close()
+            self._port = None
 
     def _send(self, cmd: str) -> None:
         self._port.write((cmd + "\r\n").encode())
@@ -108,6 +112,8 @@ class _SerialDSP7000:
 
     def query(self, cmd: str) -> str:
         with self._lock:
+            if self._port is None:
+                return ""
             self._send(cmd)
             if self._log:
                 self._log("TX", cmd)
@@ -118,6 +124,8 @@ class _SerialDSP7000:
 
     def send(self, cmd: str) -> None:
         with self._lock:
+            if self._port is None:
+                return
             self._send(cmd)
             if self._log:
                 self._log("TX", cmd)
@@ -131,12 +139,16 @@ class _SerialDSP7000:
 
 _OD_RE = re.compile(r"S\s*([\d.+-]+)\s*T\s*([\d.+-]+)\s*([RLA])", re.IGNORECASE)
 
-def _parse_od(response: str) -> tuple[float, float, str]:
-    """Parse OD response: 'SxxxxxxTxxxxxR' → (speed, torque, direction)."""
-    m = _OD_RE.search(response)
+def _parse_od(response: str) -> tuple[float | None, float | None, str]:
+    """Parse OD response: 'SxxxxxxTxxxxxR' → (speed, torque, direction).
+    A missing/garbled response yields (None, None, '') — never zeros."""
+    m = _OD_RE.search(response or "")
     if m:
-        return float(m.group(1)), float(m.group(2)), m.group(3).upper()
-    return 0.0, 0.0, "R"
+        try:
+            return float(m.group(1)), float(m.group(2)), m.group(3).upper()
+        except ValueError:
+            pass
+    return None, None, ""
 
 
 # ── Public driver ──────────────────────────────────────────────────────────────
@@ -201,12 +213,14 @@ class MagtrolDSP7000:
 
     def disconnect(self) -> None:
         self.stop_polling()
-        if self._real:
+        # unpublish first so no new commands start, then close (close waits
+        # for any in-flight transaction via the transport lock)
+        real, self._real = self._real, None
+        if real:
             try:
-                self._real.close()
+                real.close()
             except Exception:
                 pass
-            self._real = None
 
     def get_config(self):
         return self._cfg
@@ -242,141 +256,163 @@ class MagtrolDSP7000:
                     cd = self.read_channel(ch)
                     with self._lock:
                         self._state.channels[ch - 1] = cd
+                state = self.get_state()
                 for cb in list(self._callbacks):
                     try:
-                        cb(self._state)
+                        cb(state)
                     except Exception:
                         pass
             except Exception:
                 pass
             self._poll_stop.wait(interval)
 
+    def get_state(self) -> DSP7000State:
+        """Thread-safe snapshot of the last known state — no serial I/O.
+        ChannelData objects are replaced wholesale by the poll thread, never
+        mutated in place, so sharing references is safe."""
+        with self._lock:
+            s = self._state
+            return DSP7000State(
+                channels        = list(s.channels),
+                speed_setpoint  = list(s.speed_setpoint),
+                torque_setpoint = list(s.torque_setpoint),
+                current_output  = list(s.current_output),
+                brake_on        = list(s.brake_on),
+                speed_alarm     = list(s.speed_alarm),
+                torque_alarm    = list(s.torque_alarm),
+                power_alarm     = list(s.power_alarm),
+                alarms_enabled  = list(s.alarms_enabled),
+                pid_frozen      = list(s.pid_frozen),
+                tare_active     = list(s.tare_active),
+                active_channel  = s.active_channel,
+            )
+
     # ── measurement ───────────────────────────────────────────────────────────
 
     def identify(self) -> str:
-        if self._real:
-            return self._real.query("*IDN?")
-        return ""
+        return self._query_cmd("*IDN?")
 
     def read_channel(self, ch: int = 1) -> ChannelData:
         """Query OD1 or OD2 and return ChannelData."""
         assert ch in (1, 2)
-        if self._real:
-            resp = self._real.query(f"OD{ch}")
+        real = self._real
+        if real:
+            resp = real.query(f"OD{ch}")
             speed, torque, direction = _parse_od(resp)
-            power = (2.0 * math.pi * speed / 60.0) * torque
+            power = ((2.0 * math.pi * speed / 60.0) * torque
+                     if speed is not None and torque is not None else None)
             return ChannelData(speed=speed, torque=torque,
                                power=power, direction=direction)
         return ChannelData()
 
     def read_status(self) -> int:
-        if self._real:
+        real = self._real
+        if real:
             try:
-                resp = self._real.query("STAT")
+                resp = real.query("STAT")
                 return int(resp.strip(), 16)
             except Exception:
                 return 0
         return 0
 
+
+    # ── locked command primitives ─────────────────────────────────────────────
+    # A local reference is taken before use so a concurrent disconnect()
+    # (which sets self._real = None) can never cause an AttributeError
+    # between the check and the call.  The transport serialises port access
+    # with its own internal lock.
+
+    def _send_cmd(self, cmd: str) -> None:
+        real = self._real
+        if real:
+            real.send(cmd)
+
+    def _query_cmd(self, cmd: str) -> str:
+        real = self._real
+        if real:
+            return real.query(cmd)
+        return ""
+
     # ── speed control ─────────────────────────────────────────────────────────
 
     def set_speed(self, ch: int, rpm: float) -> None:
-        if self._real:
-            self._real.send(f"N{ch},{rpm:.2f}")
+        self._send_cmd(f"N{ch},{rpm:.2f}")
 
     def reset_speed(self, ch: int) -> None:
         """Release speed control (free run, brake off)."""
-        if self._real:
-            self._real.send(f"N{ch}")
+        self._send_cmd(f"N{ch}")
 
     def set_speed_pid(self, ch: int, p: int = 50, i: int = 10, d: int = 0) -> None:
-        if self._real:
-            self._real.send(f"NP{ch},{p}")
-            self._real.send(f"NI{ch},{i}")
-            self._real.send(f"ND{ch},{d}")
+        self._send_cmd(f"NP{ch},{p}")
+        self._send_cmd(f"NI{ch},{i}")
+        self._send_cmd(f"ND{ch},{d}")
 
     # ── torque control ────────────────────────────────────────────────────────
 
     def set_torque(self, ch: int, torque: float) -> None:
-        if self._real:
-            self._real.send(f"Q{ch},{torque:.2f}")
+        self._send_cmd(f"Q{ch},{torque:.2f}")
 
     def reset_torque(self, ch: int) -> None:
-        if self._real:
-            self._real.send(f"Q{ch}")
+        self._send_cmd(f"Q{ch}")
 
     def set_torque_pid(self, ch: int, p: int = 50, i: int = 10, d: int = 0) -> None:
-        if self._real:
-            self._real.send(f"QP{ch},{p}")
-            self._real.send(f"QI{ch},{i}")
-            self._real.send(f"QD{ch},{d}")
+        self._send_cmd(f"QP{ch},{p}")
+        self._send_cmd(f"QI{ch},{i}")
+        self._send_cmd(f"QD{ch},{d}")
 
     # ── current / brake output ────────────────────────────────────────────────
 
     def set_current(self, ch: int, pct: float) -> None:
         """Set brake current output 0–99.99 %."""
         pct = max(0.0, min(99.99, pct))
-        if self._real:
-            self._real.send(f"I{ch},{pct:.2f}")
+        self._send_cmd(f"I{ch},{pct:.2f}")
 
     def reset_current(self, ch: int) -> None:
-        if self._real:
-            self._real.send(f"I{ch}")
+        self._send_cmd(f"I{ch}")
 
     # ── ramp ──────────────────────────────────────────────────────────────────
 
     def ramp_up(self, ch: int, linear: bool = True, rate_or_time: float = 100.0) -> None:
         """PU command: ramp up to current speed setpoint."""
         mode = 0 if linear else 1
-        if self._real:
-            self._real.send(f"PU{ch},{mode},{rate_or_time:.2f}")
+        self._send_cmd(f"PU{ch},{mode},{rate_or_time:.2f}")
 
     def ramp_down(self, ch: int, linear: bool = True, rate_or_time: float = 100.0) -> None:
         """PD command: ramp down to 0."""
         mode = 0 if linear else 1
-        if self._real:
-            self._real.send(f"PD{ch},{mode},{rate_or_time:.2f}")
+        self._send_cmd(f"PD{ch},{mode},{rate_or_time:.2f}")
 
     def abort_ramp(self, ch: int) -> None:
         """PR command: halt ramp, return to free run."""
-        if self._real:
-            self._real.send(f"PR{ch}")
+        self._send_cmd(f"PR{ch}")
 
     # ── channel reset ─────────────────────────────────────────────────────────
 
     def reset_channel(self, ch: int) -> None:
         """R1/R2: manual control on, brake off."""
-        if self._real:
-            self._real.send(f"R{ch}")
+        self._send_cmd(f"R{ch}")
 
     # ── alarms ────────────────────────────────────────────────────────────────
 
     def set_speed_alarm(self, ch: int, rpm: float) -> None:
-        if self._real:
-            self._real.send(f"ALS{ch},{rpm:.2f}")
+        self._send_cmd(f"ALS{ch},{rpm:.2f}")
 
     def set_torque_alarm(self, ch: int, val: float) -> None:
-        if self._real:
-            self._real.send(f"ALT{ch},{val:.2f}")
+        self._send_cmd(f"ALT{ch},{val:.2f}")
 
     def set_power_alarm(self, ch: int, kw: float) -> None:
-        if self._real:
-            self._real.send(f"ALP{ch},{kw:.2f}")
+        self._send_cmd(f"ALP{ch},{kw:.2f}")
 
     def set_alarms(self, ch: int, enable: bool) -> None:
-        if self._real:
-            self._real.send(f"ALL{ch},{1 if enable else 0}")
+        self._send_cmd(f"ALL{ch},{1 if enable else 0}")
 
     # ── PID / misc ────────────────────────────────────────────────────────────
 
     def freeze_pid(self, ch: int, freeze: bool) -> None:
-        if self._real:
-            self._real.send(f"FRZ{ch},{1 if freeze else 0}")
+        self._send_cmd(f"FRZ{ch},{1 if freeze else 0}")
 
     def tare(self, ch: int, enable: bool) -> None:
-        if self._real:
-            self._real.send(f"TS{ch}" if enable else f"TR{ch}")
+        self._send_cmd(f"TS{ch}" if enable else f"TR{ch}")
 
     def save(self, ch: int) -> None:
-        if self._real:
-            self._real.send(f"SAVE,{ch}")
+        self._send_cmd(f"SAVE,{ch}")
